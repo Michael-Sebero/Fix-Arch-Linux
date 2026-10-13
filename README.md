@@ -2,7 +2,7 @@
     <img src="https://i.postimg.cc/VN4QtMzw/Fix-Arch.png" style="width:50%; height:auto;" />
 </p>
 
-Repair tool for Arch Linux and Arch-based distributions (Artix, EndeavourOS, Manjaro, CachyOS). It supports systemd, OpenRC, runit, s6 and dinit, runs on an installed system or from a live USB, and asks before it changes anything. Every file it replaces or moves is kept in `/var/lib/fix-arch-linux/backup/<date>/`.
+Repair tool for Arch Linux and Arch-based distributions (Artix, EndeavourOS, Manjaro, CachyOS). It supports systemd, OpenRC, runit, s6 and dinit runs on an installed system or from a live USB, and asks before it changes anything. Every file it replaces or moves is kept in `/var/lib/fix-arch-linux/backup/<date>/`.
 
 ## What this script fixes
 
