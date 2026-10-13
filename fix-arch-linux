@@ -1,0 +1,3416 @@
+#!/usr/bin/env bash
+# fix-arch-linux: diagnose and repair common problems on Arch Linux and Arch-based systems
+# https://github.com/Michael-Sebero/Fix-Arch-Linux
+
+shopt -s nullglob extglob
+
+VERSION=2.0.0
+SELF=$(readlink -f -- "${BASH_SOURCE[0]}")
+STAMP=$(date +%Y%m%d-%H%M%S)
+BACKUP_DIR=/var/lib/fix-arch-linux/backup/$STAMP
+ARCH_NEWS_URL=https://archlinux.org/feeds/news/
+ARCH_MIRRORLIST_URL='https://archlinux.org/mirrorlist/?country=all&protocol=https&ip_version=4&use_mirror_status=on'
+AUR_URL=https://aur.archlinux.org
+ALA_URL=https://archive.archlinux.org/packages
+REMOVED_REPOS=(community community-testing testing testing-debug staging staging-debug)
+NOCONFIRM=0
+N_OK=0 N_WARN=0 N_FAIL=0
+CHOICE=-1
+CHOOSE_START=
+CHOOSE_QUIT=back
+NC=()
+EXTRA_TARGETS=()
+declare -A LDB_SEEN=() BROKEN=() AUR_WANT=()
+
+MENU=(
+    "#Diagnostics"
+    "check:Run a full health check"
+    "report:Save a support report"
+    "logs:View system logs"
+    "#Packages"
+    "update:Update the system safely"
+    "lock:Fix 'unable to lock database' (pacman, pamac)"
+    "sync:Fix 'failed to synchronize all databases'"
+    "keyring:Fix keyring and PGP signature errors"
+    "conflicts:Fix 'exists in filesystem' conflicts"
+    "verify:Verify and repair installed packages"
+    "recover:Recover from an interrupted upgrade"
+    "mirrors:Refresh the mirrorlist"
+    "pacnew:Merge .pacnew and .pacsave files"
+    "rollback:Roll back the last upgrade or a package"
+    "rebuild:Rebuild AUR packages broken by updates"
+    "clean:Free disk space"
+    "#Boot and login"
+    "boot:Repair boot (kernels, initramfs, bootloader)"
+    "grub:Reinstall the GRUB bootloader"
+    "nvidia:Fix NVIDIA driver problems"
+    "login:Fix login problems"
+    "sudo:Fix sudo or doas access"
+    "rescue:Repair an installed system from a live USB"
+    "#System"
+    "clock:Fix the system clock"
+    "network:Fix network connectivity"
+    "dns:Fix DNS resolution and DNSCrypt"
+    "audio:Fix sound"
+    "bluetooth:Fix Bluetooth"
+    "locale:Fix locale errors"
+    "services:Restart failed services"
+)
+
+setup_ui() {
+    if [[ -t 1 && -z ${NO_COLOR-} && ${TERM:-dumb} != dumb ]]; then
+        R=$'\e[1;31m' G=$'\e[1;32m' Y=$'\e[1;33m' B=$'\e[1;34m' C=$'\e[36m' BOLD=$'\e[1m' DIM=$'\e[2m' N=$'\e[0m'
+    else
+        R='' G='' Y='' B='' C='' BOLD='' DIM='' N=''
+    fi
+    if [[ ${TERM-} == linux || "${LC_ALL-}${LC_CTYPE-}${LANG-}" != *[Uu][Tt][Ff]?(-)8* ]]; then
+        ARROW='>' KEYS='Up/Down' SEP='|'
+    else
+        ARROW='➤' KEYS='↑/↓' SEP='·'
+    fi
+}
+
+ok()   { (( ++N_OK ));   printf '%s[ OK ]%s %s\n' "$G" "$N" "$*"; }
+warn() { (( ++N_WARN )); printf '%s[WARN]%s %s\n' "$Y" "$N" "$*"; }
+fail() { (( ++N_FAIL )); printf '%s[FAIL]%s %s\n' "$R" "$N" "$*"; }
+info() { printf '%s[INFO]%s %s\n' "$B" "$N" "$*"; }
+hint() { printf '       %s%s%s\n' "$C" "$*" "$N"; }
+step() { printf '\n%s:: %s%s\n' "$BOLD" "$*" "$N"; }
+indent() { sed 's/^/       /'; }
+human() { numfmt --to=iec-i --suffix=B -- "${1:-0}" 2>/dev/null || printf '%sB\n' "${1:-0}"; }
+
+has_tty() { { : </dev/tty; } 2>/dev/null; }
+
+confirm() {
+    local def=${2:-y} ans opts='[Y/n]'
+    [[ $def == n ]] && opts='[y/N]'
+    if (( NOCONFIRM )) || ! has_tty; then
+        printf '%s %s %s\n' "$1" "$opts" "$def"
+        [[ $def == y ]]
+        return
+    fi
+    read -rp "$1 $opts " ans </dev/tty
+    ans=${ans:-$def}
+    [[ ${ans,,} == y?(es) ]]
+}
+
+ask() {
+    REPLY=${2-}
+    if (( NOCONFIRM )) || ! has_tty; then return 0; fi
+    read -rp "$1${2:+ [$2]}: " REPLY </dev/tty
+    REPLY=${REPLY:-${2-}}
+}
+
+pause() {
+    local x
+    if (( NOCONFIRM )) || ! has_tty; then return 0; fi
+    read -rsp "${1:-Press Enter to continue...}" x </dev/tty
+    : "$x"
+    echo
+}
+
+page() {
+    if (( ! NOCONFIRM )) && [[ -t 1 ]] && command -v less >/dev/null; then less -R; else cat; fi
+}
+
+read_key() {
+    local k c1 c2 c3
+    IFS= read -rsn1 k </dev/tty || { echo quit; return; }
+    if [[ $k == $'\e' ]]; then
+        IFS= read -rsn1 -t 0.05 c1 </dev/tty
+        if [[ $c1 == [\[O] ]]; then
+            IFS= read -rsn1 -t 0.05 c2 </dev/tty
+            k+=$c1$c2
+            if [[ $c2 == [0-9] ]]; then
+                IFS= read -rsn1 -t 0.05 c3 </dev/tty
+                k+=$c3
+            fi
+        else
+            k+=$c1
+        fi
+    fi
+    case $k in
+        $'\e[A'|$'\eOA'|k|K) echo up ;;
+        $'\e[B'|$'\eOB'|j|J) echo down ;;
+        $'\e[5~') echo pgup ;;
+        $'\e[6~') echo pgdn ;;
+        $'\e[H'|$'\eOH'|$'\e[1~'|g) echo home ;;
+        $'\e[F'|$'\eOF'|$'\e[4~'|G) echo end ;;
+        ''|' ') echo enter ;;
+        q|Q|$'\e') echo quit ;;
+        *) echo none ;;
+    esac
+}
+
+# choose TITLE ITEM... ; items starting with '#' are headers; sets CHOICE
+choose() {
+    local title=$1; shift
+    local -a items=("$@")
+    local n=$# sel=-1 top=0 rows avail i out key
+    for (( i = 0; i < n; i++ )); do
+        [[ ${items[i]} == '#'* ]] || { sel=$i; break; }
+    done
+    (( sel >= 0 )) || return 1
+    if [[ $CHOOSE_START == +([0-9]) ]] && (( CHOOSE_START < n )) && [[ ${items[CHOOSE_START]} != '#'* ]]; then
+        sel=$CHOOSE_START
+    fi
+    CHOOSE_START=
+    CHOICE=$sel
+    if (( NOCONFIRM )) || ! has_tty; then return 0; fi
+    printf '\e[?25l' >/dev/tty
+    while :; do
+        read -r rows _ < <(stty size </dev/tty 2>/dev/null)
+        [[ $rows == +([0-9]) ]] && (( rows >= 10 )) || rows=24
+        avail=$(( rows - 5 ))
+        (( avail < 3 )) && avail=3
+        (( sel < top )) && top=$sel
+        if (( sel > 0 && sel - 1 < top )) && [[ ${items[sel-1]} == '#'* ]]; then top=$(( sel - 1 )); fi
+        (( sel >= top + avail )) && top=$(( sel - avail + 1 ))
+        out=$'\e[H\e[2J'"$BOLD  $title$N"$'\n'"$DIM  $SUBTITLE$N"$'\n\n'
+        for (( i = top; i < n && i < top + avail; i++ )); do
+            if [[ ${items[i]} == '#'* ]]; then
+                out+="  $C${items[i]#\#}$N"$'\n'
+            elif (( i == sel )); then
+                out+="$BOLD$ARROW ${items[i]}$N"$'\n'
+            else
+                out+="  ${items[i]}"$'\n'
+            fi
+        done
+        out+=$'\n'"$DIM  $KEYS move   Enter select   q $CHOOSE_QUIT$N"
+        printf '%s' "$out" >/dev/tty
+        key=$(read_key)
+        case $key in
+            up) for (( i = sel - 1; i >= 0; i-- )); do [[ ${items[i]} == '#'* ]] || { sel=$i; break; }; done ;;
+            down) for (( i = sel + 1; i < n; i++ )); do [[ ${items[i]} == '#'* ]] || { sel=$i; break; }; done ;;
+            pgup)
+                i=$(( sel - avail )); (( i < 0 )) && i=0
+                while (( i < sel )) && [[ ${items[i]} == '#'* ]]; do (( i++ )); done
+                sel=$i ;;
+            pgdn)
+                i=$(( sel + avail )); (( i >= n )) && i=$(( n - 1 ))
+                while (( i > sel )) && [[ ${items[i]} == '#'* ]]; do (( i-- )); done
+                sel=$i ;;
+            home) for (( i = 0; i < n; i++ )); do [[ ${items[i]} == '#'* ]] || { sel=$i; break; }; done ;;
+            end) for (( i = n - 1; i >= 0; i-- )); do [[ ${items[i]} == '#'* ]] || { sel=$i; break; }; done ;;
+            enter) CHOICE=$sel; break ;;
+            quit) CHOICE=-1; break ;;
+        esac
+    done
+    printf '\e[?25h\e[H\e[2J' >/dev/tty
+    (( CHOICE >= 0 ))
+}
+
+backup() {
+    local p
+    for p; do
+        [[ -e $p || -L $p ]] || continue
+        mkdir -p -- "$BACKUP_DIR${p%/*}" && cp -a -- "$p" "$BACKUP_DIR$p" || return 1
+    done
+}
+
+move_aside() {
+    mkdir -p -- "$BACKUP_DIR${1%/*}" && mv -f -- "$1" "$BACKUP_DIR$1"
+}
+
+run_capture() {
+    local log=$1; shift
+    if [[ -t 0 && -t 1 ]] && command -v script >/dev/null; then
+        SHELL=/bin/bash script -qefc "$(printf '%q ' "$@")" "$log"
+    else
+        "$@" 2>&1 | tee "$log"
+        return "${PIPESTATUS[0]}"
+    fi
+}
+
+clean_log() {
+    sed -e 's/\x1b\[[0-9;?]*[[:alpha:]]//g' -e 's/.*\r\(.\)/\1/' -e 's/\r$//' -- "$1" 2>/dev/null
+}
+
+detect_system() {
+    local osr
+    DISTRO_ID=arch DISTRO_NAME="Arch Linux"
+    if [[ -r /etc/os-release ]]; then
+        osr=$(. /etc/os-release 2>/dev/null; printf '%s\x1f%s' "${ID-}" "${PRETTY_NAME:-${NAME-}}")
+        DISTRO_ID=${osr%%$'\x1f'*} DISTRO_NAME=${osr#*$'\x1f'}
+        DISTRO_ID=${DISTRO_ID:-arch} DISTRO_NAME=${DISTRO_NAME:-Arch Linux}
+    fi
+    IN_CHROOT=0
+    if [[ $(stat -Lc %d:%i / 2>/dev/null) != "$(stat -Lc %d:%i /proc/1/root 2>/dev/null)" ]]; then
+        IN_CHROOT=1
+    fi
+    case $(readlink -f /sbin/init 2>/dev/null) in
+        */systemd) INIT=systemd ;;
+        *openrc*) INIT=openrc ;;
+        *runit*) INIT=runit ;;
+        *s6*) INIT=s6 ;;
+        *dinit*) INIT=dinit ;;
+        *)
+            if [[ -d /run/systemd/system ]] || command -v systemctl >/dev/null; then INIT=systemd
+            elif command -v openrc >/dev/null; then INIT=openrc
+            elif command -v sv >/dev/null && [[ -d /etc/runit ]]; then INIT=runit
+            elif command -v s6-rc >/dev/null; then INIT=s6
+            elif command -v dinitctl >/dev/null; then INIT=dinit
+            else INIT=unknown
+            fi ;;
+    esac
+    INIT_LIVE=0
+    if (( ! IN_CHROOT )); then
+        case $INIT in
+            systemd) [[ -d /run/systemd/system ]] && INIT_LIVE=1 ;;
+            openrc) [[ -d /run/openrc ]] && INIT_LIVE=1 ;;
+            runit) [[ -d /run/runit ]] && INIT_LIVE=1 ;;
+            s6) [[ -d /run/service ]] && INIT_LIVE=1 ;;
+            dinit) [[ -S /run/dinitctl ]] && INIT_LIVE=1 ;;
+        esac
+    fi
+    if [[ -d /sys/firmware/efi ]]; then BOOT_MODE=UEFI; else BOOT_MODE=BIOS; fi
+}
+
+human_users() {
+    getent passwd | awk -F: '$3 >= 1000 && $3 < 60000 && $7 !~ /(nologin|false)$/ {print $1}'
+}
+
+set_user() {
+    TARGET_USER=$1
+    TARGET_HOME=$(getent passwd "$TARGET_USER" | cut -d: -f6)
+}
+
+detect_user() {
+    local -a users
+    local u=${FAL_USER:-${SUDO_USER:-${DOAS_USER:-}}}
+    TARGET_USER='' TARGET_HOME=''
+    [[ $u == root ]] && u=
+    if [[ -z $u ]]; then
+        mapfile -t users < <(human_users)
+        (( ${#users[@]} == 1 )) && u=${users[0]}
+    fi
+    [[ -n $u ]] && getent passwd "$u" >/dev/null && set_user "$u"
+    SUBTITLE="$DISTRO_NAME $SEP $INIT $SEP $BOOT_MODE"
+    (( IN_CHROOT )) && SUBTITLE+=" $SEP chroot"
+    [[ -n $TARGET_USER ]] && SUBTITLE+=" $SEP user $TARGET_USER"
+}
+
+need_user() {
+    [[ -n $TARGET_USER ]] && return 0
+    local -a users
+    mapfile -t users < <(human_users)
+    case ${#users[@]} in
+        0) fail "No regular user account exists"; return 1 ;;
+        1) set_user "${users[0]}" ;;
+        *) choose "Select the user account" "${users[@]}" || return 1; set_user "${users[CHOICE]}" ;;
+    esac
+}
+
+elevate() {
+    (( EUID == 0 )) && return 0
+    local u
+    u=$(id -un)
+    if command -v sudo >/dev/null && sudo -v; then
+        exec sudo env FAL_USER="$u" bash "$SELF" "$@"
+    elif command -v doas >/dev/null; then
+        exec doas env FAL_USER="$u" bash "$SELF" "$@"
+    elif command -v run0 >/dev/null && [[ -d /run/systemd/system ]]; then
+        exec run0 env FAL_USER="$u" bash "$SELF" "$@"
+    fi
+    echo "Root access is required. Enter the root password."
+    exec su root -c "$(printf '%q ' env FAL_USER="$u" bash "$SELF" "$@")"
+}
+
+pacman_paths() {
+    DBPATH=$(pacman-conf DBPath 2>/dev/null)
+    DBPATH=${DBPATH:-/var/lib/pacman/}
+    DBPATH=${DBPATH%/}
+    mapfile -t CACHEDIRS < <(pacman-conf CacheDir 2>/dev/null)
+    (( ${#CACHEDIRS[@]} )) || CACHEDIRS=(/var/cache/pacman/pkg/)
+    GPGDIR=$(pacman-conf GPGDir 2>/dev/null)
+    GPGDIR=${GPGDIR:-/etc/pacman.d/gnupg/}
+    GPGDIR=${GPGDIR%/}
+    PACLOG=$(pacman-conf LogFile 2>/dev/null)
+    PACLOG=${PACLOG:-/var/log/pacman.log}
+    LOCKFILE=$DBPATH/db.lck
+}
+
+svc_exists() {
+    case $INIT in
+        systemd) [[ -n $(systemctl list-unit-files --no-legend --full -- "$1.service" "$1.socket" 2>/dev/null) ]] ;;
+        openrc) [[ -e /etc/init.d/$1 ]] ;;
+        runit) [[ -d /etc/runit/sv/$1 ]] ;;
+        s6) [[ -d /etc/s6/sv/$1-srv || -d /etc/s6/sv/$1 ]] ;;
+        dinit) [[ -e /etc/dinit.d/$1 || -e /usr/lib/dinit.d/$1 ]] ;;
+        *) return 1 ;;
+    esac
+}
+
+svc_pick() {
+    local s
+    for s; do svc_exists "$s" && { printf '%s\n' "$s"; return 0; }; done
+    return 1
+}
+
+svc_enabled() {
+    case $INIT in
+        systemd) systemctl is-enabled --quiet -- "$1" 2>/dev/null ;;
+        openrc) [[ -e /etc/runlevels/default/$1 || -e /etc/runlevels/boot/$1 || -e /etc/runlevels/sysinit/$1 ]] ;;
+        runit) [[ -e /etc/runit/runsvdir/default/$1 || -e /run/runit/service/$1 ]] ;;
+        s6) [[ -e /etc/s6/adminsv/default/contents.d/$1 ]] ;;
+        dinit) [[ -e /etc/dinit.d/boot.d/$1 ]] ;;
+        *) return 1 ;;
+    esac
+}
+
+svc_active() {
+    (( INIT_LIVE )) || return 1
+    case $INIT in
+        systemd) systemctl is-active --quiet -- "$1" ;;
+        openrc) rc-service "$1" status >/dev/null 2>&1 ;;
+        runit) sv status "$1" 2>/dev/null | grep -q '^run:' ;;
+        s6) [[ $(s6-svstat -o up "/run/service/$1-srv" 2>/dev/null || s6-svstat -o up "/run/service/$1" 2>/dev/null) == true ]] ;;
+        dinit) dinitctl status "$1" 2>/dev/null | grep -q 'State: *STARTED' ;;
+        *) return 1 ;;
+    esac
+}
+
+svc_enable() {
+    local s=$1
+    case $INIT in
+        systemd)
+            if (( INIT_LIVE )); then systemctl enable --now -- "$s"; else systemctl enable -- "$s"; fi ;;
+        openrc)
+            rc-update add "$s" default && { (( ! INIT_LIVE )) || rc-service "$s" start; } ;;
+        runit)
+            ln -sfn "/etc/runit/sv/$s" "/etc/runit/runsvdir/default/$s" ;;
+        s6)
+            touch "/etc/s6/adminsv/default/contents.d/$s" || return 1
+            s6-db-reload >/dev/null 2>&1
+            (( ! INIT_LIVE )) || s6-rc -u change "$s" ;;
+        dinit)
+            if (( INIT_LIVE )); then dinitctl enable "$s"
+            else mkdir -p /etc/dinit.d/boot.d && ln -sfn "/etc/dinit.d/$s" "/etc/dinit.d/boot.d/$s"
+            fi ;;
+        *) return 1 ;;
+    esac
+}
+
+svc_disable() {
+    local s=$1
+    case $INIT in
+        systemd)
+            if (( INIT_LIVE )); then systemctl disable --now -- "$s"; else systemctl disable -- "$s"; fi ;;
+        openrc)
+            (( ! INIT_LIVE )) || rc-service "$s" stop
+            rc-update del "$s" default ;;
+        runit)
+            rm -f -- "/etc/runit/runsvdir/default/$s" "/run/runit/service/$s" ;;
+        s6)
+            (( ! INIT_LIVE )) || s6-rc -d change "$s"
+            rm -f -- "/etc/s6/adminsv/default/contents.d/$s"
+            s6-db-reload >/dev/null 2>&1
+            true ;;
+        dinit)
+            if (( INIT_LIVE )); then dinitctl disable "$s"; else rm -f -- "/etc/dinit.d/boot.d/$s"; fi ;;
+        *) return 1 ;;
+    esac
+}
+
+svc_restart() {
+    (( INIT_LIVE )) || return 0
+    case $INIT in
+        systemd) systemctl restart -- "$1" ;;
+        openrc) rc-service "$1" restart ;;
+        runit) sv restart "$1" ;;
+        s6) s6-rc -d change "$1"; s6-rc -u change "$1" ;;
+        dinit) dinitctl restart "$1" ;;
+        *) return 1 ;;
+    esac
+}
+
+svc_start() {
+    (( INIT_LIVE )) || return 0
+    case $INIT in
+        systemd) systemctl start -- "$1" ;;
+        openrc) rc-service "$1" start ;;
+        runit) sv up "$1" ;;
+        s6) s6-rc -u change "$1" ;;
+        dinit) dinitctl start "$1" ;;
+        *) return 1 ;;
+    esac
+}
+
+svc_stop() {
+    (( INIT_LIVE )) || return 0
+    case $INIT in
+        systemd) systemctl stop -- "$1" ;;
+        openrc) rc-service "$1" stop ;;
+        runit) sv down "$1" ;;
+        s6) s6-rc -d change "$1" ;;
+        dinit) dinitctl stop "$1" ;;
+        *) return 1 ;;
+    esac
+}
+
+# Artix ships init scripts as separate <package>-<init> packages
+svc_pkg() {
+    [[ $INIT == @(systemd|unknown) ]] && return 0
+    local p=$1-$INIT
+    is_installed "$p" && return 0
+    in_repo "$p" || return 0
+    pacman -S --needed --noconfirm -- "$p"
+}
+
+is_installed() { pacman -Qq -- "$1" >/dev/null 2>&1; }
+in_repo() { pacman -Si -- "$1" >/dev/null 2>&1; }
+pkg_version() { pacman -Q -- "$1" 2>/dev/null | awk '{print $2}'; }
+sync_version() { pacman -Sp --print-format '%n %v' -- "$1" 2>/dev/null | awk -v n="$1" '$1 == n {print $2; exit}'; }
+is_foreign() { [[ -n $(pacman -Qqm -- "$1" 2>/dev/null) ]]; }
+keyring_pkgs() {
+    local p
+    for p in $(pacman -Qqo /usr/share/pacman/keyrings/*.gpg 2>/dev/null | sort -u); do
+        in_repo "$p" && printf '%s\n' "$p"
+    done
+}
+
+pac() { pacman "${NC[@]}" "$@"; }
+
+pkg_triples() {
+    LC_ALL=C pacman -Qi -- "$@" 2>/dev/null | awk -F' *: ' '
+        $1 == "Name" { n = $2 } $1 == "Version" { v = $2 } $1 == "Architecture" { print n, v, $2 }'
+}
+
+cached_pkg() {
+    local c f
+    for c in "${CACHEDIRS[@]}"; do
+        for f in "${c%/}/$1-$2-"@(x86_64|any|i686).pkg.tar.!(*.sig|*.part); do
+            printf '%s\n' "$f"
+            return 0
+        done
+    done
+    return 1
+}
+
+ensure_cmd() {
+    command -v "$1" >/dev/null && return 0
+    confirm "$1 is missing. Install $2 ($3)?" y || return 1
+    pacman -S --needed --noconfirm -- "$2" && command -v "$1" >/dev/null
+}
+
+# reinstall_pkgs [--pacman-option...] [--] pkg...
+# Reinstalls the exact installed version: from the cache when possible, otherwise from the repositories
+reinstall_pkgs() {
+    local -a opts=() files=() fetch=() missing=()
+    local -A syncv=()
+    local name ver arch f rc=0 repo
+    while [[ ${1-} == -* && $1 != -- ]]; do opts+=("$1"); shift; done
+    [[ ${1-} == -- ]] && shift
+    (( $# )) || return 0
+    while read -r repo name ver _; do
+        [[ -n ${syncv[$name]-} ]] || syncv[$name]=$ver
+    done < <(pacman -Sl 2>/dev/null)
+    while read -r name ver arch; do
+        if f=$(cached_pkg "$name" "$ver"); then
+            files+=("$f")
+        elif [[ ${syncv[$name]-} == "$ver" ]]; then
+            fetch+=("$name")
+        else
+            missing+=("$name $ver (repositories: ${syncv[$name]:-not found})")
+        fi
+    done < <(pkg_triples "$@")
+    if (( ${#files[@]} )); then
+        info "Reinstalling ${#files[@]} package(s) from the package cache"
+        if ! pacman -U --noconfirm "${opts[@]}" -- "${files[@]}"; then
+            for f in "${files[@]}"; do
+                f=${f##*/}; f=${f%.pkg.tar.*}; f=${f%-*}; f=${f%-*}; f=${f%-*}
+                [[ -n ${syncv[$f]-} ]] && fetch+=("$f")
+            done
+            rc=1
+        fi
+    fi
+    if (( ${#fetch[@]} )); then
+        info "Downloading and reinstalling ${#fetch[@]} package(s)"
+        if pacman -S --noconfirm "${opts[@]}" -- "${fetch[@]}"; then rc=0; else rc=1; fi
+    fi
+    for f in "${missing[@]}"; do warn "Cannot reinstall the installed version of $f"; done
+    if (( ${#missing[@]} )); then
+        hint "Update the system first (fix-arch-linux update); AUR packages need a rebuild (fix-arch-linux rebuild)"
+        rc=1
+    fi
+    return $rc
+}
+
+pkg_file() {
+    local name=$1 ver arch f
+    read -r _ ver arch < <(pkg_triples "$name")
+    [[ -n $ver ]] || return 1
+    f=$(cached_pkg "$name" "$ver") && { printf '%s\n' "$f"; return 0; }
+    [[ $(sync_version "$name") == "$ver" ]] || return 1
+    pacman -Sw --noconfirm -- "$name" >/dev/null 2>&1 || return 1
+    cached_pkg "$name" "$ver"
+}
+
+pkg_extract_file() {
+    local pkg
+    pkg=$(pkg_file "$1") || return 1
+    bsdtar -xOf "$pkg" -- "${2#/}" >"$3" 2>/dev/null && [[ -s $3 ]]
+}
+
+lock_holders() {
+    if command -v fuser >/dev/null; then
+        fuser "$LOCKFILE" 2>/dev/null | xargs
+    else
+        find /proc/[0-9]*/fd -lname "$LOCKFILE" 2>/dev/null | cut -d/ -f3 | sort -u | xargs
+    fi
+}
+
+ensure_unlocked() {
+    [[ -e $LOCKFILE ]] || return 0
+    local h
+    h=$(lock_holders)
+    if [[ -z $h ]]; then h=$(pgrep -x pacman | xargs); fi
+    if [[ -n $h ]]; then
+        fail "The pacman database is in use by PID $h ($(ps -o comm= -p "${h// /,}" | sort -u | xargs))"
+        hint "Wait for it to finish, then retry"
+        return 1
+    fi
+    rm -f -- "$LOCKFILE" && ok "Removed stale lock $LOCKFILE"
+}
+
+mount_boot() {
+    local t rc=0
+    for t in /boot /efi /boot/efi; do
+        findmnt -s -n -M "$t" >/dev/null 2>&1 || continue
+        stat -- "$t/." >/dev/null 2>&1
+        findmnt -n -M "$t" >/dev/null 2>&1 && continue
+        if mount -- "$t" 2>"$WORKDIR/mount.err"; then
+            ok "Mounted $t"
+        else
+            fail "Could not mount $t (listed in /etc/fstab): $(head -1 "$WORKDIR/mount.err")"
+            rc=1
+        fi
+    done
+    return $rc
+}
+
+installed_kernels() {
+    local f pkgbase kver
+    for f in /usr/lib/modules/*/pkgbase; do
+        read -r pkgbase <"$f" || continue
+        kver=${f%/pkgbase}; kver=${kver##*/}
+        is_installed "$pkgbase" && printf '%s %s\n' "$pkgbase" "$kver"
+    done
+}
+
+preset_value() {
+    local preset=/etc/mkinitcpio.d/$1.preset
+    [[ -s $preset ]] || return 1
+    (
+        # shellcheck disable=SC1090
+        . "$preset" >/dev/null 2>&1
+        local p v
+        case $2 in
+            kver)
+                v=${ALL_kver-}
+                for p in "${PRESETS[@]}"; do local -n k=${p}_kver; [[ -n ${k-} ]] && v=$k; unset -n k; done
+                [[ $v == /* ]] && printf '%s\n' "$v" ;;
+            images)
+                for p in "${PRESETS[@]}"; do
+                    local -n img=${p}_image uki=${p}_uki
+                    if [[ -n ${img-} ]]; then printf '%s\n' "$img"; elif [[ -n ${ALL_image-} ]]; then printf '%s\n' "$ALL_image"; fi
+                    if [[ -n ${uki-} ]]; then printf '%s\n' "$uki"; elif [[ -n ${ALL_uki-} ]]; then printf '%s\n' "$ALL_uki"; fi
+                    unset -n img uki
+                done ;;
+        esac
+    )
+}
+
+# Verifies the kernel copied into /boot matches the installed package; sets BOOT_STALE
+check_boot_images() {
+    local pkgbase kver k img mid d found quiet=${1-}
+    BOOT_STALE=()
+    mid=$(cat /etc/machine-id 2>/dev/null)
+    while read -r pkgbase kver; do
+        k=$(preset_value "$pkgbase" kver)
+        [[ -z $k && -e /boot/vmlinuz-$pkgbase ]] && k=/boot/vmlinuz-$pkgbase
+        if [[ -n $k ]]; then
+            if [[ ! -e $k ]]; then
+                fail "$pkgbase: $k is missing"; BOOT_STALE+=("$pkgbase"); continue
+            fi
+            if [[ $(sha256sum <"$k") != "$(sha256sum <"/usr/lib/modules/$kver/vmlinuz")" ]]; then
+                fail "$pkgbase: $k does not match the installed kernel $kver (was /boot unmounted during an update?)"
+                BOOT_STALE+=("$pkgbase"); continue
+            fi
+            while read -r img; do
+                [[ -e $img ]] || { fail "$pkgbase: $img is missing"; BOOT_STALE+=("$pkgbase"); continue 2; }
+            done < <(preset_value "$pkgbase" images)
+            [[ -n $quiet ]] || ok "$pkgbase $kver: kernel and initramfs are in place"
+            continue
+        fi
+        found=
+        for d in /efi /boot /boot/efi; do
+            [[ -n $mid && -e $d/$mid/$kver/linux ]] && { found=$d/$mid/$kver; break; }
+        done
+        if [[ -n $found ]]; then
+            [[ -n $quiet ]] || ok "$pkgbase $kver: boot entry in $found"
+        else
+            warn "$pkgbase $kver: could not locate its kernel image in /boot or the ESP (fine for unified kernel images)"
+        fi
+    done < <(installed_kernels)
+}
+
+regen_initramfs() {
+    if command -v mkinitcpio >/dev/null && compgen -G '/etc/mkinitcpio.d/*.preset' >/dev/null; then
+        mkinitcpio -P
+    elif command -v reinstall-kernels >/dev/null; then
+        reinstall-kernels
+    elif command -v dracut-rebuild >/dev/null; then
+        dracut-rebuild
+    elif [[ -x /usr/lib/booster/regenerate_images ]]; then
+        /usr/lib/booster/regenerate_images
+    else
+        local -a k
+        mapfile -t k < <(installed_kernels | awk '{print $1}')
+        reinstall_pkgs "${k[@]}"
+    fi
+}
+
+repair_kernels() {
+    local hook=/usr/share/libalpm/scripts/mkinitcpio p b kver
+    reinstall_pkgs "$@"
+    check_boot_images quiet >/dev/null
+    (( ${#BOOT_STALE[@]} )) || return 0
+    if [[ -x $hook ]] && command -v mkinitcpio >/dev/null; then
+        info "Copying kernels and building images with the mkinitcpio pacman hook"
+        for p in "${BOOT_STALE[@]}"; do
+            while read -r b kver; do [[ $b == "$p" ]] && printf 'usr/lib/modules/%s/vmlinuz\n' "$kver"; done < <(installed_kernels)
+        done | sort -u | "$hook" install
+    fi
+    check_boot_images quiet >/dev/null
+    (( ${#BOOT_STALE[@]} == 0 ))
+}
+
+find_esp() {
+    local mp src pt
+    for mp in /efi /boot/efi /boot; do
+        mountpoint -q "$mp" || continue
+        [[ $(findmnt -n -o FSTYPE -M "$mp") == vfat ]] || continue
+        src=$(findmnt -n -o SOURCE -M "$mp")
+        pt=$(lsblk -no PARTTYPE "$src" 2>/dev/null)
+        if [[ ${pt,,} == c12a7328-f81f-11d2-ba4b-00a0c93ec93b || -d $mp/EFI ]]; then
+            printf '%s\n' "$mp"
+            return 0
+        fi
+    done
+    return 1
+}
+
+grub_cfg() {
+    local c
+    for c in /boot/grub/grub.cfg /efi/grub/grub.cfg /boot/efi/grub/grub.cfg; do
+        [[ -e $c ]] && { printf '%s\n' "$c"; return 0; }
+    done
+    return 1
+}
+
+sdboot_entries_check() {
+    local d f key val _ bad=0
+    for d in "$(bootctl --print-esp-path 2>/dev/null)" "$(bootctl --print-boot-path 2>/dev/null)"; do
+        [[ -n $d && -d $d/loader/entries ]] || continue
+        for f in "$d"/loader/entries/*.conf; do
+            while read -r key val _; do
+                case $key in
+                    linux|initrd|efi)
+                        [[ -e $d/${val#/} ]] || { fail "${f##*/}: $key $val is missing on $d"; bad=1; } ;;
+                esac
+            done <"$f"
+        done
+    done
+    (( bad == 0 ))
+}
+
+regen_bootloader() {
+    local cfg found=0
+    if is_installed grub; then
+        found=1
+        if cfg=$(grub_cfg); then
+            if grub-mkconfig -o "$cfg"; then ok "Regenerated $cfg"; else fail "grub-mkconfig failed"; fi
+        else
+            warn "GRUB is installed but no grub.cfg was found"
+            hint "fix-arch-linux grub"
+        fi
+    fi
+    if command -v bootctl >/dev/null && bootctl is-installed >/dev/null 2>&1; then
+        found=1
+        bootctl update --graceful >/dev/null 2>&1
+        ok "systemd-boot: $(bootctl --version 2>/dev/null | awk 'NR==1{print $1, $2}') checked"
+        sdboot_entries_check && ok "systemd-boot entries point to existing files"
+    fi
+    if (( ! found )); then
+        if is_installed refind; then info "rEFInd scans for kernels at boot; nothing to regenerate"
+        elif is_installed limine; then info "Limine: check that /boot/limine.conf references the files listed above"
+        else info "No GRUB or systemd-boot found; unified kernel images need no bootloader configuration"
+        fi
+    fi
+}
+
+dkms_rebuild() {
+    command -v dkms >/dev/null || return 0
+    local pkgbase kver hdr sv rc=0 log
+    while read -r pkgbase kver; do
+        hdr=$pkgbase-headers
+        if [[ ! -e /usr/lib/modules/$kver/build/Makefile ]]; then
+            sv=$(sync_version "$hdr")
+            if [[ -n $sv && $sv == "$(pkg_version "$pkgbase")" ]]; then
+                pacman -S --needed --noconfirm -- "$hdr" || { rc=1; continue; }
+            else
+                fail "$hdr ${sv:-(not in the repositories)} does not match $pkgbase $(pkg_version "$pkgbase")"
+                hint "Update the system first: fix-arch-linux update"
+                rc=1
+                continue
+            fi
+        fi
+        if dkms autoinstall -k "$kver" >"$WORKDIR/dkms.log" 2>&1; then
+            ok "DKMS modules are built for $kver"
+        else
+            fail "DKMS build failed for $kver"
+            indent <"$WORKDIR/dkms.log" | tail -5
+            log=$(find /var/lib/dkms -path '*/build/make.log' -printf '%T@ %p\n' 2>/dev/null | sort -nr | head -1 | cut -d' ' -f2-)
+            [[ -n $log ]] && { hint "$log:"; tail -15 "$log" | indent; }
+            rc=1
+        fi
+    done < <(installed_kernels)
+    return $rc
+}
+
+http_time() {
+    local u d
+    for u in http://archlinux.org http://www.google.com; do
+        d=$(curl -sI --max-time 8 "$u" 2>/dev/null | tr -d '\r' | sed -n 's/^[Dd]ate: //p' | head -1)
+        [[ -n $d ]] && date -d "$d" +%s 2>/dev/null && return 0
+    done
+    return 1
+}
+
+clock_offset() {
+    local net
+    net=$(http_time) || return 1
+    printf '%s\n' $(( net - $(date +%s) ))
+}
+
+sync_clock() {
+    local i was rc
+    if [[ $INIT == systemd ]] && (( INIT_LIVE )); then
+        timedatectl set-ntp true >/dev/null 2>&1
+        for i in chronyd ntpd openntpd systemd-timesyncd; do
+            svc_active "$i" && { systemctl restart "$i"; break; }
+        done
+        for (( i = 0; i < 20; i++ )); do
+            [[ $(timedatectl show -p NTPSynchronized --value 2>/dev/null) == yes ]] && return 0
+            sleep 1
+        done
+    fi
+    local svc
+    if command -v chronyd >/dev/null; then
+        was=0 svc=$(svc_pick chronyd chrony)
+        [[ -n $svc ]] && svc_active "$svc" && { was=1; svc_stop "$svc"; }
+        timeout 30 chronyd -q 'pool pool.ntp.org iburst' >/dev/null 2>&1
+        rc=$?
+        (( was )) && svc_start "$svc"
+        (( rc == 0 )) && return 0
+    fi
+    if command -v ntpd >/dev/null && [[ $(pacman -Qqo "$(command -v ntpd)" 2>/dev/null) == ntp ]]; then
+        was=0
+        svc_active ntpd && { was=1; svc_stop ntpd; }
+        timeout 30 ntpd -qg >/dev/null 2>&1
+        rc=$?
+        (( was )) && svc_start ntpd
+        (( rc == 0 )) && return 0
+    fi
+    local t
+    t=$(http_time) || return 1
+    date -s "@$t" >/dev/null
+}
+
+enable_ntp() {
+    local s
+    if [[ $INIT == systemd ]]; then
+        timedatectl set-ntp true >/dev/null 2>&1 && ok "Network time synchronization enabled" && return 0
+        systemctl enable systemd-timesyncd >/dev/null 2>&1 && ok "Enabled systemd-timesyncd"
+        return
+    fi
+    local name
+    for s in chrony ntp openntpd; do
+        is_installed "$s" || continue
+        svc_pkg "$s"
+        case $s in
+            chrony) name=$(svc_pick chronyd chrony) ;;
+            ntp) name=$(svc_pick ntpd) ;;
+            openntpd) name=$(svc_pick openntpd ntpd) ;;
+        esac
+        [[ -n $name ]] || continue
+        if svc_enabled "$name"; then ok "$name is enabled"; else svc_enable "$name" && ok "Enabled $name"; fi
+        return 0
+    done
+    warn "No NTP client is installed; the clock will drift again"
+    if confirm "Install chrony and enable it?" y; then
+        pacman -S --needed --noconfirm chrony && svc_pkg chrony && name=$(svc_pick chronyd chrony) && svc_enable "$name" && ok "chrony installed and $name enabled"
+    fi
+}
+
+# Tab-separated "epoch<TAB>title<TAB>link" from the Arch news RSS feed on stdin
+parse_feed() {
+    local it t l d ts
+    tr -d '\n' | sed 's/<item>/\n/g' | sed '1d' | while IFS= read -r it; do
+        t=$(sed -n 's:.*<title>\(.*\)</title>.*:\1:p' <<<"$it")
+        l=$(sed -n 's:.*<link>\(.*\)</link>.*:\1:p' <<<"$it")
+        d=$(sed -n 's:.*<pubDate>\(.*\)</pubDate>.*:\1:p' <<<"$it")
+        ts=$(date -d "$d" +%s 2>/dev/null) || continue
+        t=$(sed -e 's/&lt;/</g' -e 's/&gt;/>/g' -e 's/&quot;/"/g' -e "s/&#39;/'/g" -e 's/&amp;/\&/g' <<<"$t")
+        printf '%s\t%s\t%s\n' "$ts" "$t" "$l"
+    done
+}
+
+last_upgrade_epoch() {
+    local l
+    l=$(grep -a 'starting full system upgrade' "$PACLOG" 2>/dev/null | tail -1)
+    [[ $l =~ ^\[([^]]+)\] ]] && date -d "${BASH_REMATCH[1]}" +%s 2>/dev/null
+}
+
+# Returns 1 when news that needs attention was published since the last upgrade
+news_check() {
+    local since feed ts title link n=0 important=0
+    since=$(last_upgrade_epoch) || since=0
+    feed=$(curl -fsS --max-time 15 "$ARCH_NEWS_URL" 2>/dev/null) || { warn "Could not download the Arch Linux news feed"; return 0; }
+    while IFS=$'\t' read -r ts title link; do
+        (( ts > since )) || continue
+        (( ++n ))
+        if [[ ${title,,} == *@(intervention|require|breaking|will need|may need|replace|drops|switch|deprecat|incident)* ]]; then
+            fail "$(date -d "@$ts" +%F) $title"
+            important=1
+        else
+            info "$(date -d "@$ts" +%F) $title"
+        fi
+        hint "$link"
+    done < <(parse_feed <<<"$feed")
+    (( n )) || ok "No Arch Linux news since your last upgrade"
+    (( important == 0 ))
+}
+
+nvidia_scan() {
+    local d dev p
+    NV_GPUS=() NV_OLD=0 NV_KEPLER=0 NV_OPEN=0 NV_LEGACY=0 NV_UTILS='' NV_UTILS_VER=''
+    for d in /sys/bus/pci/devices/*; do
+        [[ $(<"$d/vendor") == 0x10de && $(<"$d/class") == 0x03* ]] || continue
+        dev=$(<"$d/device")
+        NV_GPUS+=("${d##*/} $dev")
+        (( dev < 0x1e00 )) && NV_OLD=1
+        (( dev < 0x1340 )) && NV_KEPLER=1
+    done
+    mapfile -t NV_PKGS < <(pacman -Qq 2>/dev/null | grep -E '^(lib32-)?(opencl-)?nvidia(-[0-9]+xx)?(-lts)?(-open)?(-beta)?(-dkms|-utils|-settings)?$|^nvidia-(lts-)?open(-beta)?(-dkms)?$')
+    for p in "${NV_PKGS[@]}"; do
+        [[ $p == *-open* ]] && NV_OPEN=1
+        if [[ $p == nvidia?(-+([0-9])xx)-utils ]]; then
+            NV_UTILS=$p
+            NV_UTILS_VER=$(pkg_version "$p")
+        fi
+    done
+    [[ $NV_UTILS == nvidia-+([0-9])xx-utils ]] && NV_LEGACY=1
+    NV_BAD=0
+    if (( NV_OLD )) && [[ -n $NV_UTILS ]]; then
+        if (( NV_OPEN )); then NV_BAD=1
+        elif (( ! NV_LEGACY )) && [[ $NV_UTILS_VER == +([0-9]).* ]] && (( ${NV_UTILS_VER%%.*} >= 590 )); then NV_BAD=1
+        fi
+    fi
+}
+
+# Health summary of the NVIDIA setup; returns 1 when no NVIDIA GPU is present
+nvidia_report() {
+    local g pkgbase kver loaded
+    nvidia_scan
+    (( ${#NV_GPUS[@]} )) || return 1
+    for g in "${NV_GPUS[@]}"; do
+        info "NVIDIA GPU ${g#* }: $(lspci -s "${g%% *}" 2>/dev/null | cut -d: -f3- | sed 's/^ //')"
+    done
+    if [[ -z $NV_UTILS ]]; then
+        if [[ -d /sys/module/nouveau ]]; then ok "Using the open-source nouveau driver"
+        else warn "No NVIDIA driver package is installed and nouveau is not loaded"
+        fi
+        return 0
+    fi
+    info "Installed: ${NV_PKGS[*]}"
+    if (( NV_BAD )); then
+        if (( NV_OPEN )); then fail "The open kernel modules (nvidia-open) do not support this GPU: they need Turing (GTX 16xx/RTX 20xx) or newer"
+        else fail "NVIDIA $NV_UTILS_VER dropped support for Maxwell, Pascal and older GPUs (Arch news 2025-12-20)"
+        fi
+        if (( NV_KEPLER )); then hint "This GPU predates Maxwell: use nouveau or nvidia-470xx-dkms (AUR)"
+        else hint "fix-arch-linux nvidia switches to nvidia-580xx-dkms from the AUR"
+        fi
+    elif (( NV_OLD )); then
+        ok "The installed driver branch supports this GPU"
+    fi
+    while read -r pkgbase kver; do
+        if [[ -n $(find "/usr/lib/modules/$kver" -name 'nvidia.ko*' -print -quit 2>/dev/null) ]]; then
+            ok "nvidia module available for $kver"
+        else
+            fail "No nvidia kernel module for $kver ($pkgbase)"
+        fi
+    done < <(installed_kernels)
+    if [[ -r /sys/module/nvidia/version ]]; then
+        loaded=$(</sys/module/nvidia/version)
+        if [[ -n $NV_UTILS_VER && ${NV_UTILS_VER%-*} != "$loaded" ]]; then
+            fail "Loaded nvidia module $loaded differs from $NV_UTILS $NV_UTILS_VER (reboot after the update)"
+        else
+            ok "nvidia module $loaded is loaded"
+        fi
+    fi
+    [[ -d /sys/module/nouveau ]] && warn "nouveau is loaded although the NVIDIA driver is installed (reboot, or the nvidia module failed to load)"
+    return 0
+}
+
+nvidia_legacy_switch() {
+    local -a remove=() add=(nvidia-580xx-utils nvidia-580xx-dkms)
+    local p
+    for p in nvidia nvidia-dkms nvidia-lts nvidia-open nvidia-open-dkms nvidia-lts-open nvidia-utils nvidia-settings lib32-nvidia-utils opencl-nvidia lib32-opencl-nvidia; do
+        is_installed "$p" && remove+=("$p")
+    done
+    is_installed nvidia-settings && add+=(nvidia-580xx-settings)
+    is_installed lib32-nvidia-utils && add+=(lib32-nvidia-580xx-utils)
+    need_user || return 1
+    info "Packages to remove: ${remove[*]:-none}"
+    info "Packages to build from the AUR: ${add[*]}"
+    confirm "Switch to the 580xx legacy driver?" y || return 1
+    ensure_headers || return 1
+    if (( ${#remove[@]} )); then pacman -Rdd --noconfirm -- "${remove[@]}" || return 1; fi
+    if aur_install "${add[@]}"; then
+        ok "Installed the NVIDIA 580xx legacy driver"
+        is_installed opencl-nvidia || [[ " ${remove[*]} " != *" opencl-nvidia "* ]] || hint "OpenCL was removed with opencl-nvidia; install the matching 580xx OpenCL package from the AUR if you need it"
+    else
+        fail "Building the legacy driver failed; the system will use the basic framebuffer driver until it is installed"
+        return 1
+    fi
+    regen_initramfs
+}
+
+ensure_headers() {
+    local pkgbase kver hdr sv rc=0
+    while read -r pkgbase kver; do
+        hdr=$pkgbase-headers
+        is_installed "$hdr" && continue
+        sv=$(sync_version "$hdr")
+        if [[ -n $sv && $sv == "$(pkg_version "$pkgbase")" ]]; then
+            pacman -S --needed --noconfirm -- "$hdr" || rc=1
+        else
+            fail "$hdr is needed for DKMS but ${sv:+version $sv }does not match $pkgbase $(pkg_version "$pkgbase")"
+            hint "Update the system first: fix-arch-linux update"
+            rc=1
+        fi
+    done < <(installed_kernels)
+    return $rc
+}
+
+aur_helper() {
+    [[ -n $TARGET_USER ]] || return 1
+    local h
+    for h in paru yay; do
+        command -v "$h" >/dev/null || continue
+        runuser -u "$TARGET_USER" -- "$h" --version >/dev/null 2>&1 && { printf '%s\n' "$h"; return 0; }
+    done
+    return 1
+}
+
+aur_install() {
+    local h
+    need_user || return 1
+    if h=$(aur_helper); then
+        runuser -u "$TARGET_USER" -- "$h" -S --needed "$@"
+        return
+    fi
+    aur_build "$@"
+}
+
+aur_rebuild() {
+    local h
+    need_user || return 1
+    if h=$(aur_helper); then
+        runuser -u "$TARGET_USER" -- "$h" -S --rebuild "$@"
+        return
+    fi
+    aur_build "$@"
+}
+
+# Builds AUR packages with makepkg as the regular user and installs them as root
+aur_build() {
+    need_user || return 1
+    local name base dir work f n rc=0
+    local -a bases=() deps=() missing=() repo=() aurdeps=() out=() inst=()
+    for name; do
+        AUR_WANT[$name]=1
+        base=$(curl -fsS --max-time 20 "$AUR_URL/rpc/v5/info?arg%5B%5D=$name" 2>/dev/null | sed -n 's/.*"PackageBase":"\([^"]*\)".*/\1/p')
+        if [[ -z $base ]]; then fail "$name was not found in the AUR"; return 1; fi
+        [[ " ${bases[*]} " == *" $base "* ]] || bases+=("$base")
+    done
+    ensure_cmd git git "needed to download AUR packages" || return 1
+    if ! is_installed base-devel; then
+        confirm "Install base-devel (needed to build AUR packages)?" y || return 1
+        pacman -S --needed --noconfirm base-devel || return 1
+    fi
+    work=$(runuser -u "$TARGET_USER" -- mktemp -d /tmp/fix-arch-linux-aur.XXXXXX) || return 1
+    for base in "${bases[@]}"; do
+        dir=$work/$base
+        step "Building $base from the AUR"
+        if ! runuser -u "$TARGET_USER" -- git clone -q --depth 1 "$AUR_URL/$base.git" "$dir"; then
+            fail "Could not clone $AUR_URL/$base.git"; rc=1; continue
+        fi
+        [[ -s $dir/PKGBUILD && -s $dir/.SRCINFO ]] || { fail "$base has no PKGBUILD"; rc=1; continue; }
+        if confirm "Review the PKGBUILD of $base before building (recommended)?" y; then
+            { cat "$dir/PKGBUILD"; for f in "$dir"/*.install; do printf '\n# %s\n' "${f##*/}"; cat "$f"; done; } | page
+        fi
+        confirm "Build and install $base?" y || { rc=1; continue; }
+        mapfile -t deps < <(sed -nE 's/^[[:space:]]*(depends|makedepends|checkdepends)(_x86_64)?[[:space:]]*=[[:space:]]*//p' "$dir/.SRCINFO" | sort -u)
+        missing=() repo=() aurdeps=()
+        (( ${#deps[@]} )) && mapfile -t missing < <(pacman -T -- "${deps[@]}" 2>/dev/null)
+        for f in "${missing[@]}"; do
+            f=${f%%[<>=]*}
+            if pacman -Sp -- "$f" >/dev/null 2>&1; then repo+=("$f"); else aurdeps+=("$f"); fi
+        done
+        if (( ${#aurdeps[@]} )); then
+            info "Building AUR dependencies first: ${aurdeps[*]}"
+            aur_build "${aurdeps[@]}" || { rc=1; continue; }
+        fi
+        if (( ${#repo[@]} )); then
+            pacman -S --needed --asdeps --noconfirm -- "${repo[@]}" || { rc=1; continue; }
+        fi
+        if ! (cd "$dir" && runuser -u "$TARGET_USER" -- makepkg --noconfirm --cleanbuild --force); then
+            fail "makepkg failed for $base"; rc=1; continue
+        fi
+        mapfile -t out < <(cd "$dir" && runuser -u "$TARGET_USER" -- makepkg --packagelist 2>/dev/null)
+        inst=()
+        for f in "${out[@]}"; do
+            [[ -e $f && ${f##*/} != *-debug-* ]] || continue
+            n=${f##*/}; n=${n%.pkg.tar.*}; n=${n%-*}; n=${n%-*}; n=${n%-*}
+            if [[ -n ${AUR_WANT[$n]-} ]] || is_installed "$n" || (( ${#out[@]} == 1 )); then inst+=("$f"); fi
+        done
+        (( ${#inst[@]} )) || { fail "makepkg produced no installable package for $base"; rc=1; continue; }
+        if pacman -U --noconfirm -- "${inst[@]}"; then ok "Installed $base"; else rc=1; fi
+    done
+    rm -rf -- "${work:?}"
+    return $rc
+}
+
+# Moves unowned conflicting files aside; returns 0 when the transaction should be retried
+resolve_conflicts() {
+    local txt=$1 pkg path owner moved=0 fw=0 line
+    local -a owned=() unowned=()
+    while read -r pkg path; do
+        [[ -e $path || -L $path ]] || continue
+        owner=$(pacman -Qqo -- "$path" 2>/dev/null)
+        if [[ -z $owner ]]; then
+            unowned+=("$path")
+        elif [[ $owner == linux-firmware && $pkg == linux-firmware-* ]]; then
+            fw=1
+        else
+            owned+=("$path (owned by $owner, also in $pkg)")
+        fi
+    done < <(sed -nE 's/^([^ :]+): (\/.*) exists in filesystem( \(owned by [^)]*\))?$/\1 \2/p' <<<"$txt" | sort -u)
+    while IFS= read -r line; do fail "$line"; done < <(grep -E "exists in both '" <<<"$txt" | sort -u)
+    if (( ${#unowned[@]} )); then
+        fail "${#unowned[@]} file(s) in the way are not owned by any package (left by make install, pip or a deleted package):"
+        printf '%s\n' "${unowned[@]:0:10}" | indent
+        (( ${#unowned[@]} > 10 )) && hint "... and $(( ${#unowned[@]} - 10 )) more"
+        if confirm "Move them to $BACKUP_DIR and retry?" y; then
+            for path in "${unowned[@]}"; do move_aside "$path" && moved=1; done
+            (( moved )) && ok "Moved ${#unowned[@]} file(s) aside"
+        fi
+    fi
+    if (( fw )); then
+        info "linux-firmware was split into vendor packages (Arch news 2025-06-21)"
+        if confirm "Apply the documented fix: remove linux-firmware, then install it again with the upgrade?" y; then
+            pacman -Syuw --noconfirm || return 1
+            pacman -Rdd --noconfirm linux-firmware || return 1
+            EXTRA_TARGETS+=(linux-firmware)
+        else
+            fw=0
+        fi
+    fi
+    for line in "${owned[@]}"; do fail "Conflict: $line"; done
+    if (( ${#owned[@]} )); then
+        hint "A file owned by another package usually means a package was split or renamed: check https://archlinux.org/news/"
+        (( fw )) || return 1
+    fi
+    (( moved || fw ))
+}
+
+explain_dep_failure() {
+    local txt=$1 p
+    local -a who
+    fail "The transaction is blocked by package dependencies:"
+    grep -E 'breaks dependency|unable to satisfy|could not satisfy|conflicting dependencies|are in conflict' <<<"$txt" | sort -u | head -20 | indent
+    mapfile -t who < <(sed -nE 's/.*required by ([^ ]+).*/\1/p' <<<"$txt" | sort -u)
+    for p in "${who[@]}"; do
+        if is_foreign "$p"; then
+            hint "$p is an AUR/foreign package: rebuild it (fix-arch-linux rebuild) or remove it (pacman -Rns $p)"
+        else
+            hint "$p blocks the upgrade; check https://archlinux.org/news/ for instructions"
+        fi
+    done
+}
+
+# Returns 0 when it fixed something and the failed command should be retried
+diagnose_failure() {
+    local txt
+    txt=$(clean_log "$1")
+    if grep -q 'exists in filesystem' <<<"$txt"; then
+        resolve_conflicts "$txt"
+    elif grep -qE 'invalid or corrupted package|signature from .* is (unknown trust|marginal trust|invalid|expired)|could not be looked up remotely|keyring is not writable|GPGME error|required key missing' <<<"$txt"; then
+        confirm "Signature errors detected. Repair the keyring now?" y && act_keyring
+    elif grep -q 'Could not resolve host' <<<"$txt"; then
+        fail "DNS resolution failed while downloading"
+        hint "fix-arch-linux dns"
+        return 1
+    elif grep -qE 'failed retrieving file|failed to synchronize|failed to retrieve some files|Operation too slow|Connection timed out|The requested URL returned error' <<<"$txt"; then
+        confirm "Download errors detected. Refresh the mirrorlist and retry?" y && act_mirrors
+    elif grep -qE 'breaks dependency|unable to satisfy dependency|could not satisfy dependencies|conflicting dependencies' <<<"$txt"; then
+        explain_dep_failure "$txt"
+        return 1
+    elif grep -q 'not enough free disk space' <<<"$txt"; then
+        confirm "Not enough disk space. Free some space and retry?" y && act_clean
+    elif grep -qE 'unable to lock database|could not lock database' <<<"$txt"; then
+        ensure_unlocked
+    else
+        return 1
+    fi
+}
+
+# pacman_retry LOG ARGS... : runs pacman, repairs known failures and retries up to 3 times
+pacman_retry() {
+    local log=$1 attempt; shift
+    for attempt in 1 2 3; do
+        run_capture "$log" pacman "$@" "${EXTRA_TARGETS[@]}" && { EXTRA_TARGETS=(); return 0; }
+        (( attempt < 3 )) || break
+        diagnose_failure "$log" || break
+        step "Retrying: pacman $* ${EXTRA_TARGETS[*]}"
+    done
+    EXTRA_TARGETS=()
+    return 1
+}
+
+# Prints "package pythonX.Y" for packages that still own files of an older Python
+python_old_pkgs() {
+    local cur d
+    cur=$(pkg_version python)
+    [[ -n $cur ]] || return 0
+    cur=python$(cut -d. -f1-2 <<<"$cur")
+    for d in /usr/lib/python3.*/; do
+        d=${d%/}
+        [[ ${d##*/} == "$cur" ]] && continue
+        pacman -Qqo -- "$d" 2>/dev/null | sed "s|\$| ${d##*/}|"
+    done | sort -u
+}
+
+LDD_SCAN='for f; do
+    IFS= read -r -n4 m <"$f" 2>/dev/null
+    [[ $m == $'"'"'\x7fELF'"'"' ]] || continue
+    ldd "$f" 2>/dev/null | grep -q "=> not found" && printf "%s\n" "$f"
+done'
+
+# scan_broken MODE PKG... : fills BROKEN[pkg] with files whose shared libraries do not resolve
+# MODE "bins" checks /usr/bin executables only, "all" checks every executable and shared object
+scan_broken() {
+    local mode=$1 pkg f
+    local -A fowner=()
+    local -a files=()
+    shift
+    BROKEN=()
+    (( $# )) || return 0
+    while read -r pkg f; do
+        [[ -f $f && ! -L $f ]] || continue
+        if [[ $mode == bins ]]; then
+            [[ $f == /usr/bin/?* && -x $f ]] || continue
+        else
+            [[ -x $f || $f == *.so || $f == *.so.* ]] || continue
+        fi
+        fowner[$f]=$pkg
+        files+=("$f")
+    done < <(pacman -Ql -- "$@" 2>/dev/null)
+    (( ${#files[@]} )) || return 0
+    while IFS= read -r f; do
+        BROKEN[${fowner[$f]}]+="$f "
+    done < <(printf '%s\0' "${files[@]}" | runuser -u nobody -- xargs -0 -r bash -c "$LDD_SCAN" _ 2>/dev/null)
+}
+
+scan_local_db() {
+    local d base name
+    LDB_NODESC=() LDB_NOFILES=() LDB_DUPES=() LDB_SEEN=()
+    for d in "$DBPATH"/local/*/; do
+        d=${d%/}; base=${d##*/}; name=${base%-*-*}
+        if [[ ! -s $d/desc ]]; then LDB_NODESC+=("$base"); continue; fi
+        [[ -e $d/files ]] || LDB_NOFILES+=("$base")
+        [[ -n ${LDB_SEEN[$name]-} && " ${LDB_DUPES[*]} " != *" $name "* ]] && LDB_DUPES+=("$name")
+        LDB_SEEN[$name]+="$base "
+    done
+}
+
+fix_local_db() {
+    local name base keep rc=0
+    scan_local_db
+    if (( ${#LDB_NODESC[@]} + ${#LDB_NOFILES[@]} + ${#LDB_DUPES[@]} == 0 )); then
+        ok "Every local database entry is complete"
+    fi
+    for base in "${LDB_NODESC[@]}"; do
+        name=${base%-*-*}
+        fail "Database entry $base has no description file"
+        move_aside "$DBPATH/local/$base" || { rc=1; continue; }
+        if in_repo "$name"; then
+            if pacman -S --dbonly --noconfirm -- "$name" && pacman -S --noconfirm -- "$name"; then ok "Restored $name"; else rc=1; fi
+        else
+            warn "$name is not in the repositories; its entry was moved to $BACKUP_DIR and its files are now untracked"
+            rc=1
+        fi
+    done
+    for name in "${LDB_DUPES[@]}"; do
+        keep=
+        for base in ${LDB_SEEN[$name]}; do
+            if [[ -z $keep ]] || (( $(vercmp "${base#"$name"-}" "${keep#"$name"-}") > 0 )); then keep=$base; fi
+        done
+        for base in ${LDB_SEEN[$name]}; do
+            [[ $base == "$keep" ]] && continue
+            fail "Duplicate database entry $base (keeping $keep)"
+            move_aside "$DBPATH/local/$base" || rc=1
+        done
+        reinstall_pkgs "$name" || rc=1
+    done
+    for base in "${LDB_NOFILES[@]}"; do
+        name=${base%-*-*}
+        fail "Database entry $base has no file list"
+        : >"$DBPATH/local/$base/files"
+        reinstall_pkgs --overwrite='*' -- "$name" || rc=1
+    done
+    if pacman -Dk >"$WORKDIR/dk.log" 2>&1; then
+        ok "pacman -Dk: database is consistent"
+    else
+        fail "pacman -Dk reports problems:"
+        head -15 "$WORKDIR/dk.log" | indent
+        rc=1
+    fi
+    return $rc
+}
+
+update_system() {
+    local log=$WORKDIR/update.log start
+    local -a kr
+    start=$(wc -l <"$PACLOG" 2>/dev/null || echo 0)
+    for log in $(pacman-conf --repo-list 2>/dev/null); do
+        [[ " ${REMOVED_REPOS[*]} " == *" $log "* ]] && { fix_dead_repos; break; }
+    done
+    log=$WORKDIR/update.log
+    mapfile -t kr < <(keyring_pkgs)
+    step "Refreshing package databases and keyrings (${kr[*]:-none})"
+    if ! pacman_retry "$log" -Sy --needed --noconfirm "${kr[@]}"; then
+        fail "Could not refresh the package databases"
+        hint "fix-arch-linux sync"
+        return 1
+    fi
+    nvidia_update_guard || return 1
+    step "Upgrading packages"
+    if ! pacman_retry "$log" -Su "${NC[@]}"; then
+        fail "The upgrade did not complete"
+        return 1
+    fi
+    post_update "$start"
+}
+
+nvidia_update_guard() {
+    nvidia_scan
+    (( NV_OLD && ! NV_LEGACY && ! NV_BAD )) && [[ -n $NV_UTILS ]] || return 0
+    local sv
+    sv=$(sync_version nvidia-utils)
+    [[ $sv == +([0-9]).* ]] && (( ${sv%%.*} >= 590 )) || return 0
+    warn "This upgrade installs NVIDIA $sv, which does not support your GPU (Maxwell, Pascal or older)"
+    hint "Arch news 2025-12-20: use nvidia-580xx-dkms from the AUR"
+    choose "Legacy NVIDIA GPU detected" "Switch to nvidia-580xx-dkms first, then upgrade" "Upgrade anyway" "Cancel" || return 1
+    case $CHOICE in
+        0) nvidia_legacy_switch ;;
+        1) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+post_update() {
+    local start=$1 new f
+    new=$(tail -n +"$(( start + 1 ))" "$PACLOG" 2>/dev/null)
+    step "After the upgrade"
+    while read -r f; do warn "New config file: $f"; done < <(grep -oE '/[^ ]+\.pacnew' <<<"$new" | sort -u)
+    grep -q '\.pacnew' <<<"$new" && hint "Merge them: fix-arch-linux pacnew"
+    if grep -qE '\] (upgraded|installed) grub ' <<<"$new"; then
+        warn "GRUB was updated; its boot code on disk is unchanged until grub-install runs"
+        hint "fix-arch-linux grub"
+    fi
+    if [[ ! -d /usr/lib/modules/$(uname -r) ]] && (( ! IN_CHROOT )); then
+        warn "The running kernel was replaced: reboot before loading new modules"
+    elif grep -qE '\] upgraded (linux[^ ]*|systemd|glibc|mesa|nvidia[^ ]*|amd-ucode|intel-ucode|linux-firmware[^ ]*) ' <<<"$new"; then
+        info "Core components were updated: reboot soon"
+    fi
+    if command -v dkms >/dev/null && dkms status 2>/dev/null | grep -qvE ': installed'; then
+        warn "Some DKMS modules are not built:"
+        dkms status 2>/dev/null | grep -vE ': installed' | indent
+        hint "fix-arch-linux boot"
+    fi
+    local -a py
+    mapfile -t py < <(python_old_pkgs | cut -d' ' -f1 | sort -u)
+    if (( ${#py[@]} )); then
+        warn "Packages still built for an older Python: ${py[*]}"
+        hint "fix-arch-linux rebuild"
+    fi
+    ok "Upgrade finished"
+}
+
+fix_dead_repos() {
+    local r s code alive
+    local -a dead=()
+    for r in $(pacman-conf --repo-list 2>/dev/null); do
+        [[ " ${REMOVED_REPOS[*]} " == *" $r "* ]] || continue
+        alive=0
+        while read -r s; do
+            case $s in
+                file://*) [[ -e ${s#file://}/$r.db ]] && alive=1 ;;
+                *) code=$(curl -s -o /dev/null -I --max-time 10 -w '%{http_code}' "$s/$r.db" 2>/dev/null); [[ $code == 200 ]] && alive=1 ;;
+            esac
+            (( alive )) && break
+        done < <(pacman-conf --repo="$r" Server 2>/dev/null | head -3)
+        (( alive )) || dead+=("$r")
+    done
+    if (( ! ${#dead[@]} )); then ok "No removed repositories in pacman.conf"; return 0; fi
+    fail "pacman.conf lists repositories that no longer exist: ${dead[*]} (Arch news 2025-02-17)"
+    confirm "Comment them out of /etc/pacman.conf?" y || return 1
+    backup /etc/pacman.conf || return 1
+    comment_repos /etc/pacman.conf "${dead[@]}" && ok "Disabled ${dead[*]} (backup in $BACKUP_DIR)"
+}
+
+comment_repos() {
+    local file=$1 tmp; shift
+    tmp=$(mktemp "$WORKDIR/conf.XXXXXX") || return 1
+    awk -v list=" $* " '
+        /^[[:space:]]*\[[^]]+\][[:space:]]*$/ { s = $0; gsub(/[][[:space:]]/, "", s); dead = index(list, " " s " ") > 0 }
+        dead && !/^[[:space:]]*(#|$)/ { print "#" $0; next }
+        { print }' "$file" >"$tmp" && cat "$tmp" >"$file"
+}
+
+check_download_user() {
+    local u
+    u=$(pacman-conf DownloadUser 2>/dev/null)
+    [[ -n $u ]] || return 0
+    if getent passwd "$u" >/dev/null; then ok "pacman download user '$u' exists"; return 0; fi
+    fail "pacman download user '$u' does not exist"
+    if command -v systemd-sysusers >/dev/null && [[ -e /usr/lib/sysusers.d/alpm.conf ]]; then
+        systemd-sysusers /usr/lib/sysusers.d/alpm.conf
+    else
+        useradd --system --user-group --home-dir / --shell /usr/bin/nologin --comment "Arch Linux Package Management" "$u"
+    fi
+    getent passwd "$u" >/dev/null && ok "Created user '$u'"
+}
+
+mirrorlist_files() {
+    awk '
+        /^[[:space:]]*\[/ { sec = $0 }
+        /^[[:space:]]*Include[[:space:]]*=/ && sec !~ /\[options\]/ { sub(/^[^=]*=[[:space:]]*/, ""); sub(/[[:space:]]+$/, ""); print }
+    ' /etc/pacman.conf 2>/dev/null | sort -u
+}
+
+repo_for_include() {
+    awk -v f="$1" '
+        /^[[:space:]]*\[/ { s = $0; gsub(/[][[:space:]]/, "", s) }
+        /^[[:space:]]*Include[[:space:]]*=/ { v = $0; sub(/^[^=]*=[[:space:]]*/, "", v); sub(/[[:space:]]+$/, "", v); if (v == f && s != "options") { print s; exit } }
+    ' /etc/pacman.conf
+}
+
+refresh_arch_mirrorlist() {
+    local f=$1 tmp
+    tmp=$(mktemp "$WORKDIR/mirrors.XXXXXX")
+    if command -v reflector >/dev/null; then
+        info "Ranking the 20 most recently synchronized HTTPS mirrors with reflector"
+        reflector --protocol https --age 12 --latest 20 --sort rate --save "$tmp" || { fail "reflector failed"; return 1; }
+    else
+        info "Downloading the current mirror list from archlinux.org"
+        curl -fsS --max-time 30 -o "$tmp" "$ARCH_MIRRORLIST_URL" || { fail "Could not download the mirror list"; return 1; }
+        sed -i 's/^#Server/Server/' "$tmp"
+        if command -v rankmirrors >/dev/null; then
+            info "Ranking the 30 best-scored mirrors by speed"
+            grep -m30 '^Server' "$tmp" >"$tmp.top"
+            rankmirrors -n 10 -m 3 -r core "$tmp.top" >"$tmp" 2>/dev/null || cp "$tmp.top" "$tmp"
+        fi
+    fi
+    grep -q '^Server' "$tmp" || { fail "The generated list has no servers"; return 1; }
+    backup "$f"
+    cat "$tmp" >"$f"
+    ok "Wrote $(grep -c '^Server' "$f") mirrors to $f"
+}
+
+refresh_other_mirrorlist() {
+    local f=$1 owner=$2 src tmp repo
+    tmp=$(mktemp "$WORKDIR/mirrors.XXXXXX")
+    if [[ -e $f.pacnew ]]; then
+        src=$f.pacnew
+    elif [[ -n $owner ]] && pkg_extract_file "$owner" "$f" "$tmp.orig"; then
+        src=$tmp.orig
+    else
+        src=$f
+    fi
+    if command -v rankmirrors >/dev/null && repo=$(repo_for_include "$f") && [[ -n $repo ]]; then
+        info "Ranking mirrors from ${src##*/} for [$repo]"
+        sed 's/^#[[:space:]]*Server/Server/' "$src" | grep '^Server' | head -40 >"$tmp.in"
+        rankmirrors -n 10 -m 3 -r "$repo" "$tmp.in" >"$tmp" 2>/dev/null
+    else
+        cp -- "$src" "$tmp"
+    fi
+    grep -q '^Server' "$tmp" || { fail "No working mirrors found for $f"; return 1; }
+    backup "$f"
+    cat "$tmp" >"$f"
+    [[ $src == "$f.pacnew" ]] && rm -f -- "$f.pacnew"
+    ok "Wrote $(grep -c '^Server' "$f") mirrors to $f"
+}
+
+failed_services() {
+    case $INIT in
+        systemd) systemctl --failed --no-legend --plain 2>/dev/null | awk '{print $1}' ;;
+        openrc) rc-status --crashed 2>/dev/null | awk 'NF {print $1}' ;;
+        runit) for s in /run/runit/service/*; do sv status "$s" 2>/dev/null | grep -qE '^(down|fail)' && printf '%s\n' "${s##*/}"; done ;;
+    esac
+}
+
+enabled_dm() {
+    local d
+    if [[ $INIT == systemd ]]; then
+        d=$(readlink -f /etc/systemd/system/display-manager.service 2>/dev/null)
+        [[ -n $d && -e $d ]] || return 1
+        d=${d##*/}
+        printf '%s\n' "${d%.service}"
+        return 0
+    fi
+    for d in sddm lightdm gdm lxdm ly greetd xdm displaymanager; do
+        svc_exists "$d" && svc_enabled "$d" && { printf '%s\n' "$d"; return 0; }
+    done
+    return 1
+}
+
+plasma_x11_check() {
+    is_installed plasma-workspace || return 0
+    (( $(vercmp "$(pkg_version plasma-workspace)" 6.4) >= 0 )) || return 0
+    is_installed plasma-x11-session && return 0
+    local last
+    last=$(sed -n 's/^Session=//p' /var/lib/sddm/state.conf 2>/dev/null | tail -1)
+    if [[ $last == */xsessions/* || $last == plasmax11* ]]; then
+        fail "Plasma 6.4+ ships the X11 session separately and your last session was X11 (Arch news 2025-06-20)"
+        if confirm "Install plasma-x11-session?" y; then
+            pacman -S --needed --noconfirm plasma-x11-session && ok "Installed plasma-x11-session"
+        fi
+    else
+        ok "Plasma Wayland session in use (plasma-x11-session is only needed for X11)"
+    fi
+}
+
+locale_norm() { local l=${1,,}; printf '%s\n' "${l//utf-8/utf8}"; }
+
+locale_values() {
+    [[ -r /etc/locale.conf ]] || return 0
+    sed -nE 's/^(LANG|LC_[A-Z_]+)=["'"'"']?([^"'"'"']*)["'"'"']?.*/\2/p' /etc/locale.conf | sort -u
+}
+
+locale_missing() {
+    local v avail
+    avail=$(locale -a 2>/dev/null | tr '[:upper:]' '[:lower:]')
+    while read -r v; do
+        [[ -z $v || $v == @(C|POSIX|C.UTF-8|C.utf8) ]] && continue
+        grep -qxF "$(locale_norm "$v")" <<<"$avail" || printf '%s\n' "$v"
+    done < <(locale_values)
+}
+
+listening_dns() {
+    local want=$1 a
+    while read -r a; do
+        a=${a%:53}; a=${a%%\%*}; a=${a#[}; a=${a%]}
+        [[ $a == "$want" || $a == 0.0.0.0 || $a == '*' || $a == :: ]] && return 0
+    done < <(ss -Hlnu 'sport = :53' 2>/dev/null | awk '{print $4}')
+    return 1
+}
+
+write_resolv_conf() {
+    local -a servers=("$@")
+    (( ${#servers[@]} )) || servers=(1.1.1.1 9.9.9.9)
+    backup /etc/resolv.conf
+    chattr -i /etc/resolv.conf 2>/dev/null
+    rm -f /etc/resolv.conf
+    { printf '# Written by fix-arch-linux on %s\n' "$STAMP"; printf 'nameserver %s\n' "${servers[@]}"; } >/etc/resolv.conf
+    ok "Wrote /etc/resolv.conf with ${servers[*]}"
+}
+
+nm_dns_mode() {
+    grep -rhsE '^[[:space:]]*dns[[:space:]]*=' /etc/NetworkManager/NetworkManager.conf /etc/NetworkManager/conf.d/ 2>/dev/null | tail -1 | sed -E 's/.*=[[:space:]]*//'
+}
+
+nm_uses_iwd() {
+    grep -rqsE '^[[:space:]]*wifi\.backend[[:space:]]*=[[:space:]]*iwd' /etc/NetworkManager/NetworkManager.conf /etc/NetworkManager/conf.d/ /usr/lib/NetworkManager/conf.d/
+}
+
+connectivity_report() {
+    local gw code
+    gw=$(ip route show default 2>/dev/null | awk '{print $3; exit}')
+    if [[ -z $gw ]]; then fail "No default route: the system is not connected to a network"; return 1; fi
+    ok "Default gateway $gw"
+    if ping -c1 -W3 1.1.1.1 >/dev/null 2>&1 || ping -c1 -W3 9.9.9.9 >/dev/null 2>&1; then
+        ok "Internet reachable by IP address"
+    else
+        warn "No reply from 1.1.1.1 or 9.9.9.9 (ICMP may be filtered)"
+    fi
+    if getent ahosts archlinux.org >/dev/null 2>&1; then
+        ok "DNS resolution works"
+    else
+        fail "DNS resolution fails"
+        hint "fix-arch-linux dns"
+        return 2
+    fi
+    code=$(curl -sS -o /dev/null --max-time 15 -w '%{http_code}' https://archlinux.org 2>"$WORKDIR/curl.err")
+    if [[ $code == [23]?? ]]; then
+        ok "HTTPS works"
+    else
+        fail "HTTPS request failed: $(head -c 160 "$WORKDIR/curl.err")"
+        grep -qi certificate "$WORKDIR/curl.err" && hint "Certificate errors usually mean a wrong clock: fix-arch-linux clock"
+        return 3
+    fi
+}
+
+chk_info() {
+    info "$DISTRO_NAME, kernel $(uname -r), init $INIT, $BOOT_MODE boot$( (( IN_CHROOT )) && printf ', chroot')"
+    info "$(pacman -Qq | wc -l) packages installed, $(pacman -Qqm | wc -l) foreign (AUR or manual)"
+}
+
+chk_pacman() {
+    local err r days t m newest=0 f upd sv
+    local -a dead=() empty=() ign=() pn=()
+    if [[ ! -e $LOCKFILE ]]; then ok "pacman database is not locked"
+    elif [[ -n $(lock_holders) ]] || pgrep -x pacman >/dev/null; then warn "pacman is running right now"
+    else fail "Stale pacman lock $LOCKFILE"; hint "fix-arch-linux lock"
+    fi
+    err=$(pacman-conf 2>&1 >/dev/null)
+    if [[ -z $err ]]; then ok "pacman.conf parses cleanly"; else fail "pacman.conf: ${err%%$'\n'*}"; fi
+    for r in $(pacman-conf --repo-list 2>/dev/null); do
+        [[ " ${REMOVED_REPOS[*]} " == *" $r "* ]] && dead+=("$r")
+        [[ -n $(pacman-conf --repo="$r" Server 2>/dev/null | head -1) ]] || empty+=("$r")
+    done
+    if (( ${#dead[@]} )); then fail "pacman.conf lists removed repositories: ${dead[*]}"; hint "fix-arch-linux sync"; else ok "No removed repositories configured"; fi
+    if (( ${#empty[@]} )); then fail "No mirrors enabled for: ${empty[*]}"; hint "fix-arch-linux mirrors"; else ok "Every repository has mirrors"; fi
+    f=$(pacman-conf DownloadUser 2>/dev/null)
+    if [[ -n $f ]] && ! getent passwd "$f" >/dev/null; then fail "pacman download user '$f' does not exist"; hint "fix-arch-linux sync"; fi
+    for f in "$DBPATH"/sync/*.db; do m=$(stat -c %Y "$f"); (( m > newest )) && newest=$m; done
+    if (( newest )); then
+        days=$(( ($(date +%s) - newest) / 86400 ))
+        if (( days > 30 )); then warn "Package databases were last refreshed $days days ago"; else ok "Package databases refreshed $days day(s) ago"; fi
+    else
+        fail "No sync databases found"; hint "fix-arch-linux sync"
+    fi
+    if t=$(last_upgrade_epoch); then
+        days=$(( ($(date +%s) - t) / 86400 ))
+        if (( days > 90 )); then warn "Last full upgrade was $days days ago: update the keyring first (fix-arch-linux update does this)"
+        else ok "Last full upgrade $days day(s) ago"
+        fi
+        if awk -v ts="$(grep -a 'starting full system upgrade' "$PACLOG" | tail -1 | cut -c2-25)" '
+            substr($0, 2, 24) > ts && /\[PACMAN\] Running / && / -[a-zA-Z]*(S[a-zA-Z]*y|y[a-zA-Z]*S)/ && !/ -[a-zA-Z]*u/ { found = 1 }
+            END { exit !found }' "$PACLOG" 2>/dev/null; then
+            warn "Databases were refreshed with pacman -Sy after the last full upgrade: installing packages now makes a partial upgrade"
+            hint "fix-arch-linux update"
+        fi
+    else
+        warn "No full system upgrade recorded in $PACLOG"
+    fi
+    mapfile -t ign < <(pacman-conf IgnorePkg 2>/dev/null; pacman-conf IgnoreGroup 2>/dev/null)
+    (( ${#ign[@]} )) && warn "Held back by IgnorePkg/IgnoreGroup: ${ign[*]} (can break dependencies on upgrade)"
+    if [[ -s $GPGDIR/trustdb.gpg ]] && [[ -s $GPGDIR/pubring.gpg || -s $GPGDIR/pubring.kbx ]]; then
+        ok "pacman keyring is initialized"
+    else
+        fail "pacman keyring is not initialized"; hint "fix-arch-linux keyring"
+    fi
+    for r in $(keyring_pkgs); do
+        f=$(pkg_version "$r") sv=$(sync_version "$r")
+        if [[ -n $sv ]] && (( $(vercmp "$sv" "$f") > 0 )); then
+            warn "$r $f is older than the repository version $sv: update it before anything else"
+            hint "fix-arch-linux update"
+        fi
+    done
+    scan_local_db
+    if (( ${#LDB_NODESC[@]} + ${#LDB_NOFILES[@]} + ${#LDB_DUPES[@]} )); then
+        fail "Damaged local database entries: ${LDB_NODESC[*]} ${LDB_NOFILES[*]} ${LDB_DUPES[*]}"
+        hint "fix-arch-linux verify"
+    elif pacman -Dk >"$WORKDIR/dk.log" 2>&1; then
+        ok "Local package database is consistent (pacman -Dk)"
+    else
+        fail "pacman -Dk: $(grep -m1 . "$WORKDIR/dk.log")"
+        hint "fix-arch-linux verify"
+    fi
+    mapfile -t pn < <(find /etc -xdev \( -name '*.pacnew' -o -name '*.pacsave' \) 2>/dev/null)
+    if (( ${#pn[@]} )); then warn "${#pn[@]} unmerged .pacnew/.pacsave file(s): ${pn[*]:0:4}"; hint "fix-arch-linux pacnew"; else ok "No unmerged .pacnew or .pacsave files"; fi
+    if command -v checkupdates >/dev/null; then
+        upd=$(timeout 90 checkupdates 2>/dev/null)
+        case $? in
+            0) info "$(wc -l <<<"$upd") update(s) available" ;;
+            2) ok "System is up to date" ;;
+            *) warn "Could not check for updates (offline?)" ;;
+        esac
+    fi
+}
+
+chk_boot() {
+    local t g cfg efi_t pkg_t
+    for t in /boot /efi /boot/efi; do
+        findmnt -s -n -M "$t" >/dev/null 2>&1 || continue
+        stat -- "$t/." >/dev/null 2>&1
+        if findmnt -n -M "$t" >/dev/null 2>&1; then ok "$t is mounted"; else fail "$t is in /etc/fstab but not mounted"; hint "fix-arch-linux boot"; fi
+    done
+    if [[ -z $(installed_kernels) ]]; then
+        fail "No kernel package is installed"; hint "fix-arch-linux boot"
+    else
+        check_boot_images
+        (( ${#BOOT_STALE[@]} )) && hint "fix-arch-linux boot"
+    fi
+    if (( ! IN_CHROOT )) && [[ ! -d /usr/lib/modules/$(uname -r) ]]; then
+        warn "Modules for the running kernel $(uname -r) are gone: reboot to load the updated kernel"
+    fi
+    if is_installed grub; then
+        if cfg=$(grub_cfg); then ok "GRUB configuration $cfg"; else fail "GRUB is installed but grub.cfg is missing"; hint "fix-arch-linux grub"; fi
+        pkg_t=$(date -d "$(LC_ALL=C pacman -Qi grub | sed -n 's/^Install Date *: //p')" +%s 2>/dev/null)
+        efi_t=0
+        if [[ $BOOT_MODE == UEFI ]]; then
+            for g in /efi/EFI/*/grub*.efi /boot/efi/EFI/*/grub*.efi /boot/EFI/*/grub*.efi; do
+                t=$(stat -c %Y "$g"); (( t > efi_t )) && efi_t=$t
+            done
+        elif [[ -e /boot/grub/i386-pc/core.img ]]; then
+            efi_t=$(stat -c %Y /boot/grub/i386-pc/core.img)
+        fi
+        if [[ -n $pkg_t ]] && (( efi_t > 0 && pkg_t > efi_t + 300 )); then
+            warn "The GRUB package was updated after grub-install last ran"
+            hint "fix-arch-linux grub"
+        fi
+    fi
+    if command -v bootctl >/dev/null && bootctl is-installed >/dev/null 2>&1; then
+        sdboot_entries_check && ok "systemd-boot entries point to existing files"
+    fi
+}
+
+chk_storage() {
+    local mp dev avail pct fails=0 btr
+    local -a devs=()
+    for mp in / /boot /efi /boot/efi /home /var /tmp; do
+        [[ $mp == / ]] || mountpoint -q "$mp" || continue
+        read -r dev _ _ avail pct _ < <(df -P -B1 -- "$mp" 2>/dev/null | tail -1)
+        [[ -n $avail ]] || continue
+        [[ " ${devs[*]} " == *" $dev "* ]] && continue
+        devs+=("$dev")
+        pct=${pct%\%}
+        if [[ $mp == @(/boot|/efi|/boot/efi) ]]; then
+            if (( avail < 16 * 1048576 )); then fail "$mp has only $(human "$avail") free"; hint "fix-arch-linux clean"
+            elif (( avail < 64 * 1048576 )); then warn "$mp has only $(human "$avail") free"
+            else ok "$mp: $(human "$avail") free"
+            fi
+        elif (( avail < 512 * 1048576 || pct >= 99 )); then fail "$mp is full: $(human "$avail") free ($pct% used)"; hint "fix-arch-linux clean"
+        elif (( avail < 2 * 1073741824 || pct >= 90 )); then warn "$mp is $pct% full ($(human "$avail") free)"
+        else ok "$mp: $(human "$avail") free ($pct% used)"
+        fi
+    done
+    if findmnt -n -o OPTIONS / | tr ',' '\n' | grep -qx ro; then
+        fail "The root filesystem is mounted read-only (usually after filesystem errors)"
+        hint "Boot a live USB and run fsck on the root partition"
+    fi
+    if command -v smartctl >/dev/null; then
+        while read -r dev _; do
+            case $(smartctl -H "$dev" 2>/dev/null) in
+                *PASSED*|*": OK"*) ok "SMART health of $dev: passed" ;;
+                *FAILED*) fail "SMART health of $dev: FAILED, back up your data now" ;;
+            esac
+        done < <(lsblk -dnpo NAME,TYPE | awk '$2 == "disk"')
+    fi
+    while read -r btr; do
+        if btrfs device stats -c "$btr" >/dev/null 2>&1; then ok "btrfs $btr: no device errors"
+        else fail "btrfs $btr reports device errors (btrfs device stats $btr)"; fi
+    done < <(findmnt -n -t btrfs -o TARGET 2>/dev/null | head -3)
+    fails=$(dmesg 2>/dev/null | grep -ciE 'I/O error|critical medium error|EXT4-fs error|BTRFS error|XFS.*(corrupt|error)')
+    (( fails )) && warn "$fails disk or filesystem error(s) in the kernel log (fix-arch-linux logs)"
+}
+
+chk_graphics() {
+    local d drv name n=0
+    for d in /sys/bus/pci/devices/*; do
+        [[ $(<"$d/class") == 0x03* ]] || continue
+        (( ++n ))
+        name=$(lspci -s "${d##*/}" 2>/dev/null | cut -d: -f3- | sed 's/^ //')
+        if [[ -e $d/driver ]]; then
+            drv=$(basename "$(readlink -f "$d/driver")")
+            ok "$name: $drv"
+        elif (( ! IN_CHROOT )); then
+            warn "$name: no kernel driver bound"
+        fi
+    done
+    (( n )) || info "No PCI display adapter found"
+    nvidia_scan
+    if (( ${#NV_GPUS[@]} )); then
+        nvidia_report
+        (( NV_BAD )) && hint "fix-arch-linux nvidia"
+    fi
+}
+
+chk_login() {
+    local dm u sh fails last
+    local -a sessions=(/usr/share/xsessions/*.desktop /usr/share/wayland-sessions/*.desktop)
+    if dm=$(enabled_dm); then ok "Display manager: $dm"
+    elif (( ${#sessions[@]} )); then warn "Desktop sessions are installed but no display manager is enabled"; hint "fix-arch-linux login"
+    fi
+    if [[ -n $dm ]] && (( ! ${#sessions[@]} )); then fail "A display manager is enabled but no desktop session is installed"; fi
+    last=$(sed -n 's/^Session=//p' /var/lib/sddm/state.conf 2>/dev/null | tail -1)
+    if [[ $last == /* && ! -e $last ]]; then fail "SDDM's last session $last no longer exists"; hint "fix-arch-linux login"; fi
+    if is_installed plasma-workspace && ! is_installed plasma-x11-session && (( $(vercmp "$(pkg_version plasma-workspace)" 6.4) >= 0 )) && [[ $last == */xsessions/* ]]; then
+        fail "Plasma X11 session is missing (Arch news 2025-06-20)"; hint "fix-arch-linux login"
+    fi
+    u=$TARGET_USER
+    if [[ -z $u ]]; then info "Run as a regular user via sudo to include per-user checks"; return; fi
+    fails=$(faillock --user "$u" 2>/dev/null | awk '$NF == "V"' | wc -l)
+    if (( fails >= 3 )); then fail "$u is locked out by pam_faillock ($fails failed attempts)"; hint "fix-arch-linux login"
+    elif (( fails )); then warn "$u has $fails recent failed login attempt(s)"
+    else ok "$u is not locked out"
+    fi
+    sh=$(getent passwd "$u" | cut -d: -f7)
+    if [[ -x $sh ]]; then ok "Login shell $sh"; else fail "Login shell $sh of $u does not exist"; hint "fix-arch-linux login"; fi
+    if [[ -d $TARGET_HOME ]]; then
+        if [[ -n $(find "$TARGET_HOME" -maxdepth 1 \( -name .Xauthority -o -name .ICEauthority \) ! -user "$u" 2>/dev/null; find "$TARGET_HOME/.cache" "$TARGET_HOME/.config" "$TARGET_HOME/.local" -xdev ! -user "$u" -print -quit 2>/dev/null) ]]; then
+            fail "Files in $TARGET_HOME are owned by another user (breaks desktop login)"; hint "fix-arch-linux login"
+        else
+            ok "$TARGET_HOME session files belong to $u"
+        fi
+    else
+        fail "Home directory $TARGET_HOME is missing"
+    fi
+    if command -v sudo >/dev/null && ! sudo -l -U "$u" 2>/dev/null | grep -q 'may run'; then
+        warn "$u cannot use sudo"; hint "fix-arch-linux sudo"
+    fi
+}
+
+chk_system() {
+    local s missing off
+    mapfile -t s < <(failed_services)
+    if (( ${#s[@]} )); then fail "Failed services: ${s[*]}"; hint "fix-arch-linux services"
+    elif [[ $INIT == @(systemd|openrc|runit) ]] && (( INIT_LIVE )); then ok "No failed services"
+    fi
+    if [[ $INIT == systemd ]] && (( INIT_LIVE )); then
+        if [[ $(timedatectl show -p NTPSynchronized --value 2>/dev/null) == yes ]]; then ok "Clock is synchronized (NTP)"
+        else warn "Clock is not synchronized by NTP"; hint "fix-arch-linux clock"
+        fi
+    fi
+    if off=$(clock_offset); then
+        (( off < 0 )) && off=$(( -off ))
+        if (( off > 300 )); then fail "System clock is off by ${off}s (breaks HTTPS and signature checks)"; hint "fix-arch-linux clock"
+        else ok "Clock is within ${off}s of network time"
+        fi
+    fi
+    [[ -e /etc/localtime ]] || { warn "No time zone set (/etc/localtime)"; hint "fix-arch-linux clock"; }
+    mapfile -t missing < <(locale_missing)
+    if [[ ! -s /etc/locale.conf ]]; then warn "/etc/locale.conf is missing"; hint "fix-arch-linux locale"
+    elif (( ${#missing[@]} )); then fail "Locale not generated: ${missing[*]}"; hint "fix-arch-linux locale"
+    else ok "Locale $(sed -n 's/^LANG=//p' /etc/locale.conf) is generated"
+    fi
+    if [[ -L /etc/resolv.conf && ! -e /etc/resolv.conf ]]; then
+        fail "/etc/resolv.conf is a broken symlink to $(readlink /etc/resolv.conf)"; hint "fix-arch-linux dns"
+    fi
+    if command -v visudo >/dev/null && ! visudo -c >/dev/null 2>&1; then
+        fail "sudoers has syntax errors: sudo is unusable"; hint "fix-arch-linux sudo"
+    fi
+}
+
+chk_foreign() {
+    local -a foreign py
+    local h p
+    mapfile -t foreign < <(pacman -Qqm)
+    mapfile -t py < <(python_old_pkgs | cut -d' ' -f1 | sort -u)
+    if (( ${#py[@]} )); then fail "Built for an older Python: ${py[*]}"; hint "fix-arch-linux rebuild"; else ok "No packages left on an older Python"; fi
+    for h in paru yay; do
+        command -v "$h" >/dev/null || continue
+        if [[ -n $TARGET_USER ]] && ! runuser -u "$TARGET_USER" -- "$h" --version >/dev/null 2>&1; then
+            fail "$h does not start (usually a libalpm update): rebuild it"; hint "fix-arch-linux rebuild"
+        fi
+    done
+    scan_broken bins "${foreign[@]}"
+    if (( ${#BROKEN[@]} )); then fail "AUR packages with missing libraries: ${!BROKEN[*]}"; hint "fix-arch-linux rebuild"
+    elif (( ${#foreign[@]} )); then ok "Foreign package executables resolve their libraries"
+    fi
+}
+
+chk_network() {
+    connectivity_report
+}
+
+chk_advisories() {
+    local v any=0
+    if is_installed linux-firmware && (( $(vercmp "$(pkg_version linux-firmware)" 20250613.12fe085f-5) < 0 )); then
+        warn "The next linux-firmware upgrade needs manual steps (Arch news 2025-06-21): fix-arch-linux update applies them"
+        any=1
+    fi
+    if is_installed mkinitcpio && (( $(vercmp "$(pkg_version mkinitcpio)" 42) >= 0 )) &&
+        grep -qsE 'tpm2' /etc/crypttab /etc/crypttab.initramfs /proc/cmdline; then
+        warn "mkinitcpio 42+ changes TPM2 PCR measurements: re-enroll TPM2 LUKS unlocking with systemd-cryptenroll (Arch news 2026-09-22)"
+        any=1
+    fi
+    for v in /etc/iptables/*.pacsave; do
+        warn "Leftover firewall rules $v after the iptables backend change (Arch news 2026-04-05)"
+        any=1
+    done
+    (( any )) || ok "No pending manual interventions detected"
+}
+
+act_check() {
+    N_OK=0 N_WARN=0 N_FAIL=0
+    step "System"; chk_info
+    step "Package manager"; chk_pacman
+    step "Boot"; chk_boot
+    step "Storage"; chk_storage
+    step "Graphics"; chk_graphics
+    step "Login"; chk_login
+    step "Services, clock and locale"; chk_system
+    step "Network"; chk_network
+    step "AUR and foreign packages"; chk_foreign
+    step "Advisories"; chk_advisories
+    printf '\n%s%d passed, %d warnings, %d failed%s\n' "$BOLD" "$N_OK" "$N_WARN" "$N_FAIL" "$N"
+    (( N_FAIL == 0 ))
+}
+
+act_report() {
+    local dir out
+    dir=${TARGET_HOME:-/root}
+    [[ -d $dir ]] || dir=/root
+    out=$dir/fix-arch-linux-report-$STAMP.txt
+    step "Collecting system information"
+    {
+        printf 'fix-arch-linux %s report, %s\n' "$VERSION" "$(date -R)"
+        printf '\n## System\n'; uname -a
+        printf 'Distribution: %s (%s)\nInit: %s  Boot: %s  Chroot: %s\n' "$DISTRO_NAME" "$DISTRO_ID" "$INIT" "$BOOT_MODE" "$IN_CHROOT"
+        printf '\n## Hardware\n'; lscpu 2>/dev/null | grep -E '^(Model name|CPU\(s\))'; free -h
+        lspci -nnk 2>/dev/null | grep -EA3 'VGA|3D|Display|Network|Ethernet|Audio'
+        printf '\n## Health check\n'; ( setup_ui; act_check )
+        printf '\n## Kernels\n'; installed_kernels; ls -la /boot 2>&1
+        printf '\n## Disks\n'; lsblk -o NAME,FSTYPE,SIZE,MOUNTPOINTS 2>&1; df -hT -x tmpfs -x devtmpfs 2>&1
+        printf '\n## Foreign packages\n'; pacman -Qm
+        printf '\n## pacman.conf\n'; grep -vE '^[[:space:]]*(#|$)' /etc/pacman.conf
+        printf '\n## First mirror per repository\n'
+        for r in $(pacman-conf --repo-list 2>/dev/null); do printf '%s: %s\n' "$r" "$(pacman-conf --repo="$r" Server 2>/dev/null | head -1)"; done
+        printf '\n## Last pacman transaction\n'; last_transaction_log
+        printf '\n## Errors this boot\n'
+        if [[ $INIT == systemd ]] && (( INIT_LIVE )); then journalctl -b -p err --no-pager 2>&1 | tail -100; else syslog_errors | tail -100; fi
+        printf '\n## Kernel errors\n'; dmesg -T --level=emerg,alert,crit,err 2>&1 | tail -50
+        printf '\n## Network\n'; ip -br addr; ip route; cat /etc/resolv.conf 2>&1
+    } >"$out" 2>&1
+    [[ -n $TARGET_USER && $dir == "$TARGET_HOME" ]] && chown "$TARGET_USER:" "$out"
+    ok "Report saved to $out"
+    hint "Review it before sharing: it contains hostnames, IP addresses and package names"
+}
+
+last_transaction_log() {
+    local n
+    n=$(grep -an '\[PACMAN\] Running' "$PACLOG" 2>/dev/null | tail -1 | cut -d: -f1)
+    [[ -n $n ]] && tail -n +"$n" "$PACLOG"
+}
+
+syslog_errors() {
+    local f
+    for f in /var/log/everything.log /var/log/messages /var/log/syslog /var/log/socklog/everything/current; do
+        [[ -r $f ]] && grep -aiE 'error|fail|critical|segfault' "$f" | tail -200
+    done
+}
+
+xorg_errors() {
+    local f
+    for f in /var/log/Xorg.0.log "$TARGET_HOME"/.local/share/xorg/Xorg.0.log; do
+        [[ -r $f ]] || continue
+        printf '== %s\n' "$f"
+        grep -a '(EE)' "$f"
+    done
+}
+
+dm_log() {
+    if [[ $INIT == systemd ]] && (( INIT_LIVE )); then
+        journalctl -b -u display-manager.service --no-pager 2>&1 | tail -150
+    fi
+    local f
+    for f in /var/log/sddm.log /var/log/lightdm/lightdm.log /var/log/lxdm.log; do
+        [[ -r $f ]] && { printf '== %s\n' "$f"; tail -100 "$f"; }
+    done
+}
+
+act_logs() {
+    local -a opts=("Errors from this boot" "Errors from the previous boot" "Kernel errors and warnings" "Last pacman transaction" "Xorg errors" "Display manager log" "Failed services")
+    if (( NOCONFIRM )) || ! has_tty; then
+        if [[ $INIT == systemd ]] && (( INIT_LIVE )); then journalctl -b -p err --no-pager; else syslog_errors; fi
+        return 0
+    fi
+    while choose "System logs" "${opts[@]}"; do
+        CHOOSE_START=$CHOICE
+        case $CHOICE in
+            0) if [[ $INIT == systemd ]] && (( INIT_LIVE )); then journalctl -b -p err --no-pager; else syslog_errors; fi ;;
+            1) if [[ $INIT == systemd ]]; then journalctl -b -1 -p err --no-pager; else echo "Previous boots need a persistent systemd journal"; fi ;;
+            2) dmesg -T --level=emerg,alert,crit,err,warn ;;
+            3) last_transaction_log ;;
+            4) xorg_errors ;;
+            5) dm_log ;;
+            6) failed_service_status ;;
+        esac 2>&1 | page
+    done
+}
+
+failed_service_status() {
+    local s
+    while read -r s; do
+        case $INIT in
+            systemd) systemctl status --no-pager -n 15 -- "$s" ;;
+            openrc) rc-service "$s" status ;;
+            runit) sv status "$s" ;;
+        esac
+        echo
+    done < <(failed_services)
+}
+
+act_update() {
+    local h
+    ensure_unlocked || return 1
+    step "Pre-flight checks"
+    local avail
+    avail=$(df -P -B1 / | awk 'NR == 2 {print $4}')
+    if (( avail < 1073741824 )); then
+        warn "Only $(human "$avail") free on /"
+        confirm "Free disk space first?" y && act_clean
+    else
+        ok "$(human "$avail") free on /"
+    fi
+    if ! mount_boot; then
+        warn "Kernel updates would be written to the root filesystem instead of the boot partition"
+        confirm "Continue anyway?" n || return 1
+    fi
+    check_download_user
+    local off
+    if off=$(clock_offset); then
+        (( off < 0 )) && off=$(( -off ))
+        if (( off > 300 )); then
+            warn "The clock is off by ${off}s"
+            confirm "Fix the clock first (downloads and signatures fail otherwise)?" y && act_clock
+        else
+            ok "Clock is correct"
+        fi
+    fi
+    if [[ $DISTRO_ID != manjaro ]]; then
+        step "Arch Linux news since your last upgrade"
+        news_check || confirm "Read the news above. Continue with the upgrade?" n || return 1
+    fi
+    update_system || return 1
+    if [[ -n $TARGET_USER ]] && h=$(aur_helper); then
+        confirm "Update AUR packages with $h?" n && runuser -u "$TARGET_USER" -- "$h" -Sua
+    fi
+    if command -v flatpak >/dev/null; then
+        confirm "Update Flatpak applications?" y && flatpak update -y --noninteractive
+    fi
+}
+
+act_lock() {
+    local f p
+    step "pacman"
+    if [[ -e $LOCKFILE ]]; then ensure_unlocked; else ok "No pacman lock ($LOCKFILE)"; fi
+    if is_installed pamac-gtk || is_installed pamac-cli || is_installed pamac-gtk3 || [[ -d /var/tmp/pamac ]]; then
+        step "pamac"
+        f=/var/tmp/pamac/dbs/db.lck
+        if [[ ! -e $f ]]; then
+            ok "No pamac lock"
+        elif pgrep -x pamac >/dev/null || pgrep -x pamac-manager >/dev/null || pgrep -f pamac-daemon >/dev/null; then
+            warn "pamac is running: close it (or wait for pamac-daemon to exit) and retry"
+        else
+            rm -f -- "$f" && ok "Removed stale pamac lock $f"
+        fi
+    fi
+    step "pacman keyring (GnuPG)"
+    p=0
+    for f in "$GPGDIR"/*.lock "$GPGDIR"/.#lk*; do
+        if pgrep -x gpg >/dev/null || pgrep -x pacman-key >/dev/null; then
+            warn "gpg is running; leaving $f"
+        else
+            rm -f -- "$f" && ok "Removed stale keyring lock $f"
+        fi
+        p=1
+    done
+    (( p )) || ok "No keyring locks"
+}
+
+act_sync() {
+    local log=$WORKDIR/sync.log r f
+    ensure_unlocked || return 1
+    step "pacman configuration"
+    f=$(pacman-conf 2>&1 >/dev/null)
+    if [[ -n $f ]]; then fail "pacman.conf has errors:"; indent <<<"$f"; return 1; fi
+    ok "pacman.conf parses cleanly"
+    fix_dead_repos
+    for r in $(pacman-conf --repo-list 2>/dev/null); do
+        if [[ -z $(pacman-conf --repo="$r" Server 2>/dev/null | head -1) ]]; then
+            fail "[$r] has no enabled mirrors"
+            confirm "Refresh the mirrorlist now?" y && act_mirrors
+            break
+        fi
+    done
+    check_download_user
+    local du
+    du=$(pacman-conf DownloadUser 2>/dev/null)
+    for f in $(pacman-conf --repo-list 2>/dev/null); do
+        [[ -n $du ]] || break
+        r=$(pacman-conf --repo="$f" Server 2>/dev/null | head -1)
+        if [[ $r == file://* ]] && ! runuser -u "$du" -- test -r "${r#file://}/$f.db" 2>/dev/null; then
+            fail "Local repository ${r#file://} is not readable by pacman's download user (Arch news 2024-09-14)"
+            if confirm "Run chown -R :alpm on it and make its directories searchable?" y; then
+                chown -R :alpm -- "${r#file://}" && find "${r#file://}" -type d -exec chmod g+rx {} + && ok "Fixed permissions of ${r#file://}"
+            fi
+        fi
+    done
+    step "Network and clock"
+    if ! connectivity_report; then
+        hint "Fix the network first: fix-arch-linux network"
+        confirm "Continue anyway (only useful with local or LAN mirrors)?" n || return 1
+    fi
+    local off
+    if off=$(clock_offset); then
+        (( off < 0 )) && off=$(( -off ))
+        (( off > 300 )) && { warn "Clock is off by ${off}s"; act_clock; }
+    fi
+    step "Removing cached sync databases"
+    rm -rf -- "$DBPATH"/sync/*.db "$DBPATH"/sync/*.sig "$DBPATH"/sync/*.part "$DBPATH"/sync/download-*
+    [[ -d /var/tmp/pamac/dbs/sync ]] && rm -rf -- /var/tmp/pamac/dbs/sync
+    ok "Cleared $DBPATH/sync"
+    step "Downloading fresh databases"
+    if pacman_retry "$log" -Syy; then
+        ok "All package databases synchronized"
+        if confirm "Upgrade the system now? (installing packages after -Syy without upgrading causes partial upgrades)" y; then
+            update_system
+        fi
+    else
+        fail "Synchronization still fails"
+        grep -E 'error|failed' <(clean_log "$log") | sort -u | head -10 | indent
+        return 1
+    fi
+}
+
+restore_custom_keys() {
+    local old=$1 fpr tmp
+    local -A shipped=()
+    tmp=$(mktemp -d "$WORKDIR/gpg.XXXXXX")
+    while read -r fpr; do shipped[$fpr]=1; done < <(gpg --homedir "$tmp" --batch --quiet --with-colons --show-keys /usr/share/pacman/keyrings/*.gpg 2>/dev/null | awk -F: '$1 == "fpr" {print $10}')
+    while read -r fpr; do
+        [[ -n ${shipped[$fpr]-} ]] && continue
+        gpg --homedir "$old" --batch --export --output "$tmp/key.gpg" --yes "$fpr" 2>/dev/null || continue
+        if pacman-key --add "$tmp/key.gpg" >/dev/null 2>&1 && pacman-key --lsign-key "$fpr" >/dev/null 2>&1; then
+            ok "Restored locally added key $fpr"
+        fi
+    done < <(gpg --homedir "$old" --batch --with-colons --list-keys 2>/dev/null | awk -F: '
+        $1 == "pub" { p = 1; next }
+        $1 == "fpr" && p { f = $10; p = 0; k[f] = 1; o[++n] = f; next }
+        $1 == "uid" && f != "" && $10 ~ /Pacman Keyring Master Key/ { delete k[f] }
+        END { for (i = 1; i <= n; i++) if (o[i] in k) print o[i] }')
+}
+
+reset_keyring() {
+    local old=$BACKUP_DIR/gnupg
+    GNUPGHOME=$GPGDIR gpgconf --kill all 2>/dev/null
+    mkdir -p -- "$BACKUP_DIR" && mv -- "$GPGDIR" "$old" || { fail "Could not move $GPGDIR aside"; return 1; }
+    if pacman-key --init >"$WORKDIR/pacman-key.log" 2>&1 && pacman-key --populate >>"$WORKDIR/pacman-key.log" 2>&1; then
+        ok "Keyring re-created from the installed keyring packages (old keyring: $old)"
+        restore_custom_keys "$old"
+    else
+        fail "pacman-key --init/--populate failed:"
+        tail -5 "$WORKDIR/pacman-key.log" | indent
+        return 1
+    fi
+}
+
+act_keyring() {
+    local -a kr
+    local log=$WORKDIR/keyring.log off f
+    ensure_unlocked || return 1
+    step "Clock"
+    if off=$(clock_offset); then
+        (( off < 0 )) && off=$(( -off ))
+        if (( off > 300 )); then warn "Clock is off by ${off}s: signatures look invalid or expired"; act_clock
+        else ok "Clock is correct"
+        fi
+    fi
+    step "Stale GnuPG processes and locks"
+    GNUPGHOME=$GPGDIR gpgconf --kill all 2>/dev/null
+    for f in "$GPGDIR"/*.lock "$GPGDIR"/.#lk*; do rm -f -- "$f" && ok "Removed $f"; done
+    if [[ ! -s $GPGDIR/trustdb.gpg ]]; then
+        warn "The keyring is not initialized"
+        if pacman-key --init >"$WORKDIR/pacman-key.log" 2>&1 && pacman-key --populate >>"$WORKDIR/pacman-key.log" 2>&1; then
+            ok "Keyring initialized"
+        else
+            fail "pacman-key --init/--populate failed:"; tail -5 "$WORKDIR/pacman-key.log" | indent
+        fi
+    fi
+    mapfile -t kr < <(keyring_pkgs)
+    step "Updating keyring packages: ${kr[*]}"
+    if pacman -Sy --needed --noconfirm "${kr[@]}" >"$log" 2>&1; then
+        ok "Keyring packages are current"
+        pacman-key --populate >/dev/null 2>&1 && ok "Keys repopulated"
+        if confirm "Also rebuild the keyring from scratch?" n; then reset_keyring || return 1; fi
+    else
+        indent <"$log" | tail -5
+        if ! grep -qiE 'signature|keyring|GPGME|PGP|trust|key ' "$log"; then
+            fail "The keyring packages could not be downloaded; this is not a keyring problem"
+            hint "fix-arch-linux sync"
+            return 1
+        fi
+        warn "Signature verification failed; rebuilding the keyring"
+        reset_keyring || return 1
+        if ! pacman -Sy --needed --noconfirm "${kr[@]}"; then
+            warn "Still failing; refreshing keys from the keyservers (this can take a while)"
+            pacman-key --refresh-keys
+            pacman -Sy --needed --noconfirm "${kr[@]}" || {
+                fail "The keyring packages still cannot be verified"
+                hint "Boot a current Arch ISO and use 'fix-arch-linux rescue': the ISO has a fresh keyring"
+                return 1
+            }
+        fi
+        pacman-key --populate >/dev/null 2>&1
+        ok "Keyring packages installed"
+    fi
+    if command -v archlinux-keyring-wkd-sync >/dev/null; then
+        step "Refreshing Arch keys via WKD"
+        if timeout 90 archlinux-keyring-wkd-sync >/dev/null 2>&1; then ok "Keys refreshed"; else warn "WKD refresh failed (offline or blocked)"; fi
+    fi
+    step "Partially downloaded packages"
+    local n=0 c
+    for c in "${CACHEDIRS[@]}"; do
+        for f in "${c%/}"/*.part; do rm -f -- "$f" && (( ++n )); done
+    done
+    ok "Removed $n partial download(s)"
+    GNUPGHOME=$GPGDIR gpgconf --kill all 2>/dev/null
+    info "If pacman reports a corrupted package file, let it delete the file and run the command again"
+}
+
+act_conflicts() {
+    local log=$WORKDIR/conflicts.log
+    local -a args
+    ensure_unlocked || return 1
+    ask "pacman arguments that failed" "-Syu"
+    read -ra args <<<"$REPLY"
+    (( ${#args[@]} )) || return 1
+    step "Running pacman ${args[*]}"
+    if pacman_retry "$log" "${args[@]}" "${NC[@]}"; then
+        ok "pacman ${args[*]} completed"
+    else
+        grep -q 'exists in filesystem' <(clean_log "$log") || info "No file conflicts were reported"
+        return 1
+    fi
+}
+
+act_verify() {
+    local mode pkg path line
+    local -A bad=()
+    local -a pkgs skip
+    ensure_unlocked || return 1
+    step "Local package database"
+    fix_local_db
+    if (( NOCONFIRM )); then mode=0
+    else
+        choose "How thorough?" "Quick: missing files (seconds)" "Full: sizes and SHA256 checksums of every file (minutes)" || return 1
+        mode=$CHOICE
+    fi
+    step "Checking installed files"
+    if (( mode == 0 )); then
+        while read -r pkg path; do bad[$pkg]+="$path (missing)"$'\n'; done < <(LC_ALL=C pacman -Qkq 2>/dev/null)
+    else
+        info "Reading every installed file; this takes a few minutes"
+        while IFS= read -r line; do
+            [[ $line =~ ^warning:\ ([^:]+):\ (.+)\ \((No\ such\ file\ or\ directory|Size\ mismatch|[A-Z0-9]+\ checksum\ mismatch|File\ type\ mismatch|Symlink\ path\ mismatch)\)$ ]] || continue
+            bad[${BASH_REMATCH[1]}]+="${BASH_REMATCH[2]} (${BASH_REMATCH[3]})"$'\n'
+        done < <(LC_ALL=C pacman -Qkk 2>&1 >/dev/null)
+    fi
+    if (( ! ${#bad[@]} )); then ok "Every package file is intact"; return 0; fi
+    mapfile -t pkgs < <(printf '%s\n' "${!bad[@]}" | sort)
+    for pkg in "${pkgs[@]}"; do
+        fail "$pkg"
+        head -3 <<<"${bad[$pkg]%$'\n'}" | indent
+    done
+    ask "Packages to skip (space separated, empty for none)" ""
+    read -ra skip <<<"$REPLY"
+    local -A skipset=()
+    local -a keep=()
+    for pkg in "${skip[@]}"; do skipset[$pkg]=1; done
+    for pkg in "${pkgs[@]}"; do [[ -n ${skipset[$pkg]-} ]] || keep+=("$pkg"); done
+    pkgs=("${keep[@]}")
+    (( ${#pkgs[@]} )) || return 0
+    confirm "Reinstall ${#pkgs[@]} package(s)?" y || return 1
+    reinstall_pkgs "${pkgs[@]}"
+}
+
+act_recover() {
+    local -A bad=()
+    local pkg path
+    step "1/6 Database lock"
+    ensure_unlocked || return 1
+    [[ -e $LOCKFILE ]] || ok "Database is unlocked"
+    step "2/6 Local package database"
+    fix_local_db
+    step "3/6 Missing package files"
+    while read -r pkg path; do bad[$pkg]=1; done < <(LC_ALL=C pacman -Qkq 2>/dev/null)
+    if (( ${#bad[@]} )); then
+        fail "Packages with missing files: ${!bad[*]}"
+        reinstall_pkgs "${!bad[@]}"
+    else
+        ok "No package files are missing"
+    fi
+    step "4/6 Completing the upgrade"
+    mount_boot || { hint "Fix /etc/fstab so the boot partition mounts, then run this again"; return 1; }
+    update_system
+    step "5/6 Boot files"
+    check_boot_images
+    if (( ${#BOOT_STALE[@]} )); then repair_kernels "${BOOT_STALE[@]}"; fi
+    regen_initramfs && ok "initramfs regenerated"
+    regen_bootloader
+    step "6/6 DKMS modules"
+    dkms_rebuild
+    info "Reboot when you are ready"
+}
+
+act_mirrors() {
+    local f owner
+    local -a files
+    if [[ $DISTRO_ID == manjaro ]] && command -v pacman-mirrors >/dev/null; then
+        step "Ranking Manjaro mirrors"
+        pacman-mirrors --fasttrack 5 && ok "Manjaro mirrorlist updated"
+    fi
+    mapfile -t files < <(mirrorlist_files)
+    for f in "${files[@]}"; do
+        [[ -e $f || -e $f.pacnew ]] || { warn "$f does not exist"; continue; }
+        [[ $DISTRO_ID == manjaro && $f == /etc/pacman.d/mirrorlist ]] && continue
+        owner=$(pacman -Qqo -- "$f" 2>/dev/null)
+        step "$f${owner:+ ($owner)}"
+        case $owner in
+            pacman-mirrorlist|archlinux-mirrorlist) refresh_arch_mirrorlist "$f" ;;
+            endeavouros-mirrorlist)
+                if command -v eos-rankmirrors >/dev/null; then eos-rankmirrors && ok "Ranked with eos-rankmirrors"; else refresh_other_mirrorlist "$f" "$owner"; fi ;;
+            cachyos-mirrorlist|cachyos-v3-mirrorlist|cachyos-v4-mirrorlist)
+                if command -v cachyos-rate-mirrors >/dev/null; then cachyos-rate-mirrors && ok "Ranked with cachyos-rate-mirrors"; else refresh_other_mirrorlist "$f" "$owner"; fi ;;
+            *) refresh_other_mirrorlist "$f" "$owner" ;;
+        esac
+    done
+    step "Testing the configured mirrors"
+    if pacman -Syy >"$WORKDIR/mirrors.log" 2>&1; then
+        ok "All repositories synchronize"
+        info "Run fix-arch-linux update before installing anything (avoids a partial upgrade)"
+    else
+        fail "Synchronization still fails:"
+        grep -E 'error' "$WORKDIR/mirrors.log" | head -5 | indent
+        return 1
+    fi
+}
+
+act_pacnew() {
+    local f orig dp
+    local -a files
+    mapfile -t files < <(find /etc -xdev \( -name '*.pacnew' -o -name '*.pacsave' -o -name '*.pacorig' \) -type f 2>/dev/null | sort)
+    if (( ! ${#files[@]} )); then ok "No .pacnew, .pacsave or .pacorig files in /etc"; return 0; fi
+    for f in "${files[@]}"; do info "$f ($(date -r "$f" +%F))"; done
+    [[ " ${files[*]} " == *mirrorlist.pacnew* ]] && hint "mirrorlist.pacnew is handled by: fix-arch-linux mirrors"
+    if (( NOCONFIRM )) || ! has_tty; then info "Run fix-arch-linux pacnew in a terminal to merge them"; return 0; fi
+    command -v diff >/dev/null || ensure_cmd diff diffutils "to compare files"
+    if command -v diff >/dev/null && { command -v pacdiff >/dev/null || ensure_cmd pacdiff pacman-contrib "provides pacdiff"; }; then
+        dp=${DIFFPROG-}
+        if [[ -z $dp ]]; then
+            if command -v nvim >/dev/null; then dp='nvim -d'
+            elif command -v vim >/dev/null; then dp='vim -d'
+            else dp='diff -u --color=always'
+            fi
+        fi
+        info "pacdiff asks what to do with each file: (V)iew diff, (O)verwrite with the new file, (R)emove it, (S)kip"
+        DIFFPROG=$dp pacdiff
+        return
+    fi
+    for f in "${files[@]}"; do
+        orig=${f%.pac@(new|save|orig)}
+        if command -v diff >/dev/null; then
+            diff -u -- "$orig" "$f" 2>&1 | page
+        else
+            { printf '==> %s\n' "$orig"; cat -- "$orig" 2>&1; printf '\n==> %s\n' "$f"; cat -- "$f"; } | page
+        fi
+        if [[ $f == *.pacnew ]]; then
+            choose "$f" "Keep the current file and delete the .pacnew" "Use the new file (the current one is backed up)" "Skip" || continue
+        else
+            choose "$f" "Delete the saved copy" "Restore the saved copy over $orig (the current one is backed up)" "Skip" || continue
+        fi
+        case $CHOICE in
+            0) rm -f -- "$f" && ok "Removed $f" ;;
+            1) backup "$orig"; mv -f -- "$f" "$orig" && ok "Installed $f as $orig" ;;
+        esac
+    done
+}
+
+downgrade_pkg() {
+    local name cur c f v sel
+    local -a vers=() srcs=() labels=()
+    local -A seen=()
+    ask "Package to downgrade" ""
+    name=$REPLY
+    [[ -n $name ]] || return 1
+    is_installed "$name" || { fail "$name is not installed"; return 1; }
+    cur=$(pkg_version "$name")
+    for c in "${CACHEDIRS[@]}"; do
+        for f in "${c%/}/$name"-+([^-])-+([^-])-@(x86_64|any|i686).pkg.tar.!(*.sig|*.part); do
+            v=${f##*/}; v=${v#"$name"-}; v=${v%-@(x86_64|any|i686).pkg.tar.*}
+            [[ -n ${seen[$v]-} || $v == "$cur" ]] && continue
+            seen[$v]=1; vers+=("$v"); srcs+=("$f")
+        done
+    done
+    if pkg_from_arch_repo "$name"; then
+        local re
+        re=$(sed 's/[.+]/\\&/g' <<<"$name")
+        while read -r f; do
+            v=${f#"$name"-}; v=${v%-@(x86_64|any).pkg.tar.@(zst|xz)}
+            [[ -n ${seen[$v]-} || $v == "$cur" ]] && continue
+            seen[$v]=1; vers+=("$v"); srcs+=("$ALA_URL/${name:0:1}/$name/$f")
+        done < <(curl -fsS --max-time 20 "$ALA_URL/${name:0:1}/$name/" 2>/dev/null | grep -oE "href=\"$re-[^\"-]+-[^\"-]+-(x86_64|any)\.pkg\.tar\.(zst|xz)\"" | sed 's/^href="//; s/"$//' | sort -Vr | head -40)
+    fi
+    (( ${#vers[@]} )) || { fail "No other versions of $name in the cache or the Arch Linux Archive"; return 1; }
+    for (( f = 0; f < ${#vers[@]}; f++ )); do
+        labels+=("${vers[f]}  [$([[ ${srcs[f]} == http* ]] && echo archive || echo cache)]")
+    done
+    choose "Installed: $name $cur. Pick a version" "${labels[@]}" || return 1
+    sel=${srcs[CHOICE]}
+    confirm "Install $name ${vers[CHOICE]}?" y || return 1
+    pacman -U --noconfirm -- "$sel" && hint "Add '$name' to IgnorePkg in /etc/pacman.conf to hold it until the regression is fixed"
+}
+
+pkg_from_arch_repo() {
+    local r
+    r=$(pacman -Sl 2>/dev/null | awk -v n="$1" '$2 == n {print $1; exit}')
+    [[ $r == @(core|extra|multilib|core-testing|extra-testing|multilib-testing) ]]
+}
+
+last_upgrades() {
+    awk '
+        /\[ALPM\] transaction started/ { cur = "" }
+        /\[ALPM\] upgraded / { o = $5; sub(/^\(/, "", o); nw = $7; sub(/\)$/, "", nw); cur = cur $4 " " o " " nw "\n" }
+        /\[ALPM\] transaction completed/ { if (cur != "") last = cur }
+        END { printf "%s", last }' "$PACLOG" 2>/dev/null
+}
+
+rollback_last() {
+    local name old new f l ext arch
+    local -a lines items=() missing=()
+    mapfile -t lines < <(last_upgrades)
+    (( ${#lines[@]} )) || { warn "No upgrade transaction in $PACLOG"; return 1; }
+    step "Packages upgraded by the last transaction"
+    for l in "${lines[@]}"; do
+        read -r name old new <<<"$l"
+        is_installed "$name" || continue
+        [[ $(pkg_version "$name") == "$new" ]] || { info "$name changed again since ($(pkg_version "$name")), skipped"; continue; }
+        if f=$(cached_pkg "$name" "$old"); then
+            items+=("$f")
+        elif pkg_from_arch_repo "$name"; then
+            f=
+            for arch in x86_64 any; do
+                for ext in zst xz; do
+                    if curl -fsIL --max-time 15 -o /dev/null "$ALA_URL/${name:0:1}/$name/$name-$old-$arch.pkg.tar.$ext" 2>/dev/null; then
+                        f=$ALA_URL/${name:0:1}/$name/$name-$old-$arch.pkg.tar.$ext; break 2
+                    fi
+                done
+            done
+            if [[ -n $f ]]; then items+=("$f"); else missing+=("$name $old"); continue; fi
+        else
+            missing+=("$name $old"); continue
+        fi
+        printf '  %s %s -> %s\n' "$name" "$new" "$old"
+    done
+    for l in "${missing[@]}"; do warn "No package file for $l"; done
+    (( ${#items[@]} )) || return 1
+    (( ${#missing[@]} )) && warn "A partial rollback can leave dependencies inconsistent; pacman will refuse if it does"
+    confirm "Downgrade ${#items[@]} package(s)?" n || return 1
+    pacman -U --noconfirm -- "${items[@]}" && hint "Hold them with IgnorePkg in /etc/pacman.conf until the regression is fixed"
+}
+
+act_rollback() {
+    ensure_unlocked || return 1
+    if (( NOCONFIRM )); then rollback_last; return; fi
+    choose "Roll back" "Undo the last upgrade transaction" "Downgrade one package" || return 1
+    case $CHOICE in
+        0) rollback_last ;;
+        1) downgrade_pkg ;;
+    esac
+}
+
+act_rebuild() {
+    local pkg
+    local -a foreign py
+    local -A need=()
+    mapfile -t foreign < <(pacman -Qqm)
+    step "Scanning ${#foreign[@]} foreign packages for missing libraries"
+    scan_broken all "${foreign[@]}"
+    for pkg in "${!BROKEN[@]}"; do
+        need[$pkg]=1
+        fail "$pkg: unresolved libraries in $(wc -w <<<"${BROKEN[$pkg]}") file(s), e.g. ${BROKEN[$pkg]%% *}"
+    done
+    step "Packages built for an older Python"
+    mapfile -t py < <(python_old_pkgs)
+    for pkg in "${py[@]}"; do
+        if is_foreign "${pkg% *}"; then need[${pkg% *}]=1; fail "${pkg% *}: built for ${pkg#* }, the system has python$(pkg_version python | cut -d. -f1-2)"
+        else warn "${pkg% *}: repository package still on ${pkg#* }; it was probably dropped from the repositories"
+        fi
+    done
+    if (( ! ${#need[@]} )); then ok "No AUR package needs a rebuild"; return 0; fi
+    confirm "Rebuild ${#need[@]} package(s) from the AUR?" y || return 1
+    aur_rebuild "${!need[@]}"
+}
+
+act_clean() {
+    local before after c n sz h
+    local -a orphans
+    before=$(df -P -B1 / | awk 'NR == 2 {print $4}')
+    step "Package cache"
+    for c in "${CACHEDIRS[@]}"; do
+        for h in "${c%/}"/download-*/; do
+            pgrep -x pacman >/dev/null && break 2
+            rm -rf -- "${h:?}" && info "Removed leftover download directory ${h%/}"
+        done
+    done
+    for c in "${CACHEDIRS[@]}"; do info "${c%/}: $(human "$(du -sb -- "$c" 2>/dev/null | cut -f1)")"; done
+    if command -v paccache >/dev/null || ensure_cmd paccache pacman-contrib "provides paccache"; then
+        if confirm "Keep the 2 newest versions of each installed package and drop uninstalled ones?" y; then
+            paccache -rk2 && paccache -ruk0
+        fi
+    elif confirm "Remove cached versions of packages that are not installed (pacman -Sc)?" y; then
+        pacman -Sc --noconfirm
+    fi
+    step "Orphaned packages"
+    mapfile -t orphans < <(pacman -Qdtq)
+    if (( ${#orphans[@]} )); then
+        info "${#orphans[@]} orphan(s): ${orphans[*]}"
+        if (( ! NOCONFIRM )) && confirm "Review and remove them?" n; then pacman -Rns -- "${orphans[@]}"; fi
+    else
+        ok "No orphaned packages"
+    fi
+    if [[ $INIT == systemd ]] && command -v journalctl >/dev/null; then
+        step "systemd journal"
+        info "$(journalctl --disk-usage 2>/dev/null)"
+        confirm "Shrink the journal to 200 MiB?" y && journalctl --vacuum-size=200M
+        if [[ -d /var/lib/systemd/coredump ]]; then
+            sz=$(du -sb /var/lib/systemd/coredump 2>/dev/null | cut -f1)
+            if (( sz > 0 )) && confirm "Delete $(human "$sz") of core dumps?" y; then rm -f /var/lib/systemd/coredump/*; fi
+        fi
+    fi
+    if [[ -n $TARGET_HOME ]]; then
+        for h in "$TARGET_HOME/.cache/yay" "$TARGET_HOME/.cache/paru"; do
+            [[ -d $h ]] || continue
+            sz=$(du -sb -- "$h" 2>/dev/null | cut -f1)
+            step "AUR build cache $h"
+            if confirm "Delete $(human "$sz") of AUR build files?" y; then rm -rf --one-file-system -- "${h:?}"/*; fi
+        done
+    fi
+    if command -v flatpak >/dev/null; then
+        step "Flatpak"
+        confirm "Remove unused Flatpak runtimes?" y && flatpak uninstall --unused -y --noninteractive
+    fi
+    after=$(df -P -B1 / | awk 'NR == 2 {print $4}')
+    n=$(( after - before ))
+    (( n < 0 )) && n=0
+    ok "Freed $(human "$n") on /; $(human "$after") available"
+}
+
+act_boot() {
+    local -a kernels
+    local p
+    step "Boot partitions"
+    if ! mount_boot; then
+        hint "Writing kernels now would put them on the root filesystem instead of the boot partition"
+        hint "Compare /etc/fstab with the output of lsblk -f, fix the entry, then run this again"
+        return 1
+    fi
+    for p in /boot /efi /boot/efi; do
+        mountpoint -q "$p" && info "$p: $(human "$(df -P -B1 "$p" | awk 'NR == 2 {print $4}')") free"
+    done
+    step "Kernels"
+    mapfile -t kernels < <(installed_kernels)
+    if (( ! ${#kernels[@]} )); then
+        fail "No kernel package is installed"
+        confirm "Install linux?" y && pacman -S --needed --noconfirm linux && mapfile -t kernels < <(installed_kernels)
+        (( ${#kernels[@]} )) || return 1
+    fi
+    check_boot_images
+    if (( ${#BOOT_STALE[@]} )); then
+        step "Restoring kernels: ${BOOT_STALE[*]}"
+        if repair_kernels "${BOOT_STALE[@]}"; then ok "Kernel images restored"; else fail "Some kernels could not be restored"; fi
+    fi
+    step "initramfs"
+    if confirm "Regenerate the initramfs for every kernel?" y; then
+        if regen_initramfs; then ok "initramfs regenerated"; else fail "initramfs generation reported errors (see above)"; fi
+    fi
+    step "DKMS modules"
+    if command -v dkms >/dev/null; then dkms_rebuild; else ok "DKMS is not installed"; fi
+    step "Bootloader"
+    regen_bootloader
+    info "Reboot to apply"
+}
+
+boot_disk() {
+    local src
+    src=$(findmnt -n -o SOURCE --target /boot)
+    src=${src%%\[*}
+    lsblk -nsrpo NAME,TYPE -- "$src" 2>/dev/null | awk '$2 == "disk" {print $1; exit}'
+}
+
+act_grub() {
+    local esp target id disk d n cfg
+    local -a cmd ids
+    is_installed grub || { fail "GRUB is not installed"; hint "pacman -S grub"; return 1; }
+    mount_boot || return 1
+    if [[ $BOOT_MODE == UEFI ]]; then
+        esp=$(find_esp) || { fail "No mounted EFI system partition found (/efi, /boot/efi or /boot)"; return 1; }
+        target=x86_64-efi
+        [[ $(cat /sys/firmware/efi/fw_platform_size 2>/dev/null) == 32 ]] && target=i386-efi
+        for d in "$esp"/EFI/*/; do
+            n=${d%/}; n=${n##*/}
+            [[ ${n^^} == BOOT ]] && continue
+            compgen -G "$d"'grub*.efi' >/dev/null && ids+=("$n")
+        done
+        if (( ${#ids[@]} == 1 )); then id=${ids[0]}
+        elif (( ${#ids[@]} > 1 )); then choose "Which GRUB installation?" "${ids[@]}" || return 1; id=${ids[CHOICE]}
+        else id=GRUB
+        fi
+        cmd=(grub-install --target="$target" --efi-directory="$esp" --bootloader-id="$id")
+        cfg=$(grub_cfg) && [[ ${cfg%/grub/grub.cfg} != /boot ]] && cmd+=(--boot-directory="${cfg%/grub/grub.cfg}")
+    else
+        disk=$(boot_disk)
+        [[ -n $disk ]] || { fail "Could not find the disk that holds /boot"; return 1; }
+        info "Boot disk: $disk ($(lsblk -dno MODEL,SIZE "$disk" 2>/dev/null | xargs))"
+        cmd=(grub-install --target=i386-pc "$disk")
+    fi
+    info "Command: ${cmd[*]}"
+    confirm "Reinstall GRUB?" y || return 1
+    "${cmd[@]}" || { fail "grub-install failed"; return 1; }
+    ok "GRUB installed"
+    if command -v sbctl >/dev/null && sbctl status 2>/dev/null | grep -qi 'secure boot:.*enabled'; then
+        sbctl sign-all && ok "Re-signed EFI binaries with sbctl"
+    fi
+    grub-mkconfig -o "$(grub_cfg || echo /boot/grub/grub.cfg)" && ok "grub.cfg regenerated"
+}
+
+act_nvidia() {
+    local pkgbase kver hdr
+    step "NVIDIA driver"
+    if ! nvidia_report; then ok "No NVIDIA GPU detected"; return 0; fi
+    if [[ -z $NV_UTILS ]]; then
+        if (( NV_KEPLER )); then info "This GPU is older than Maxwell: nouveau is the supported driver"
+        elif (( NV_OLD )); then hint "For the proprietary driver on this GPU install nvidia-580xx-dkms from the AUR"
+        else hint "For the proprietary driver: pacman -S nvidia-open-dkms nvidia-utils plus the headers of each kernel"
+        fi
+        return 0
+    fi
+    if (( NV_BAD )); then
+        if (( NV_KEPLER )); then
+            warn "This GPU needs nvidia-470xx-dkms (AUR) or nouveau; switch manually"
+        elif confirm "Switch to the supported nvidia-580xx-dkms driver now?" y; then
+            nvidia_legacy_switch || return 1
+            nvidia_scan
+        fi
+    fi
+    step "Kernel headers and DKMS"
+    if pacman -Qq | grep -qE '^nvidia.*-dkms$'; then
+        ensure_headers
+        dkms_rebuild
+    else
+        while read -r pkgbase kver; do
+            [[ -n $(find "/usr/lib/modules/$kver" -name 'nvidia.ko*' -print -quit 2>/dev/null) ]] && continue
+            fail "$pkgbase has no NVIDIA module: the prebuilt nvidia/nvidia-open packages only cover linux and linux-lts"
+            hdr=nvidia-open-dkms
+            (( NV_OLD )) && hdr=nvidia-580xx-dkms
+            hint "Switch to $hdr to cover every kernel"
+            if [[ $hdr == nvidia-open-dkms ]] && confirm "Install nvidia-open-dkms and the kernel headers now?" y; then
+                ensure_headers && pac -S --needed nvidia-open-dkms && dkms_rebuild
+            fi
+            break
+        done < <(installed_kernels)
+    fi
+    step "Package consistency"
+    local p v
+    for p in "${NV_PKGS[@]}"; do
+        [[ $p == @(nvidia|nvidia-open|nvidia-lts|nvidia-lts-open|nvidia-dkms|nvidia-open-dkms) ]] || continue
+        v=$(pkg_version "$p")
+        if [[ -n $NV_UTILS_VER && ${v%-*} != "${NV_UTILS_VER%-*}" && ${v%%.*} == +([0-9]) ]]; then
+            fail "$p $v does not match $NV_UTILS $NV_UTILS_VER (partial upgrade)"
+            hint "fix-arch-linux update"
+        else
+            ok "$p $v matches $NV_UTILS"
+        fi
+    done
+    if command -v mkinitcpio >/dev/null && grep -qsE '^[[:space:]]*MODULES=.*nvidia' /etc/mkinitcpio.conf /etc/mkinitcpio.conf.d/*.conf; then
+        step "initramfs (nvidia modules are built in)"
+        regen_initramfs && ok "initramfs regenerated"
+    fi
+    info "Reboot to load the driver"
+}
+
+act_login() {
+    local u h st exp sh fails dm
+    local -a bad dms
+    need_user || return 1
+    u=$TARGET_USER h=$TARGET_HOME
+    step "Account $u"
+    fails=$(faillock --user "$u" 2>/dev/null | awk '$NF == "V"' | wc -l)
+    if (( fails )); then
+        warn "$fails failed login attempt(s) recorded; 3 lock the account for 10 minutes (pam_faillock defaults)"
+        confirm "Reset the failed-login counter?" y && faillock --user "$u" --reset && ok "faillock counter reset"
+    else
+        ok "No faillock lockout"
+    fi
+    st=$(awk -F: -v u="$u" '$1 == u {print $2}' /etc/shadow 2>/dev/null)
+    case $st in
+        ''|'!'|'!!'|'!*'|'*') warn "$u has no password set"; hint "Set one: passwd $u" ;;
+        '!'*) fail "The password of $u is locked"; confirm "Unlock it?" y && usermod -U "$u" && ok "Password unlocked" ;;
+        *) ok "Password is set" ;;
+    esac
+    exp=$(LC_ALL=C chage -l "$u" 2>/dev/null | sed -n 's/^Account expires[[:space:]]*: //p')
+    if [[ -n $exp && $exp != never ]] && (( $(date -d "$exp" +%s 2>/dev/null || echo 9999999999) < $(date +%s) )); then
+        fail "The account expired on $exp"
+        confirm "Remove the expiry date?" y && chage -E -1 "$u" && ok "Account expiry removed"
+    fi
+    exp=$(LC_ALL=C chage -l "$u" 2>/dev/null | sed -n 's/^Password expires[[:space:]]*: //p')
+    if [[ -n $exp && $exp != never ]] && (( $(date -d "$exp" +%s 2>/dev/null || echo 9999999999) < $(date +%s) )); then
+        fail "The password expired on $exp"; hint "Set a new one: passwd $u"
+    fi
+    sh=$(getent passwd "$u" | cut -d: -f7)
+    if [[ ! -x $sh ]]; then
+        fail "Login shell $sh does not exist"
+        confirm "Switch $u to /bin/bash?" y && chsh -s /bin/bash "$u" && ok "Shell set to /bin/bash"
+    elif ! grep -qxF "$sh" /etc/shells; then
+        warn "$sh is not listed in /etc/shells"
+        confirm "Add it?" y && printf '%s\n' "$sh" >>/etc/shells && ok "Added $sh to /etc/shells"
+    else
+        ok "Login shell $sh"
+    fi
+    step "Home directory $h"
+    if [[ ! -d $h ]]; then
+        fail "$h does not exist"
+        if confirm "Create it from /etc/skel?" y; then
+            mkdir -p -- "$h" && cp -rT /etc/skel "$h" && chown -R "$u:" "$h" && chmod 700 "$h" && ok "Created $h"
+        fi
+    else
+        if [[ $(stat -c %U "$h") != "$u" ]]; then
+            fail "$h is owned by $(stat -c %U "$h")"
+            confirm "Give it back to $u?" y && chown "$u:" "$h" && ok "Fixed owner of $h"
+        fi
+        mapfile -t bad < <(find "$h" -maxdepth 1 \( -name .Xauthority -o -name .ICEauthority -o -name .xsession-errors \) ! -user "$u" 2>/dev/null; find "$h/.cache" "$h/.config" "$h/.local" "$h/.dbus" -xdev ! -user "$u" 2>/dev/null)
+        if (( ${#bad[@]} )); then
+            fail "${#bad[@]} file(s) in $h are not owned by $u (typical after running GUI programs with sudo)"
+            printf '%s\n' "${bad[@]:0:5}" | indent
+            confirm "Give them back to $u?" y && printf '%s\0' "${bad[@]}" | xargs -0 chown -h "$u:" && ok "Ownership fixed"
+        else
+            ok "Session files belong to $u"
+        fi
+    fi
+    if [[ $(stat -c %a /tmp) != 1777 ]]; then
+        fail "/tmp has mode $(stat -c %a /tmp) instead of 1777"
+        confirm "Fix it?" y && chmod 1777 /tmp && ok "/tmp mode fixed"
+    fi
+    for st in / /home /tmp; do
+        mountpoint -q "$st" || [[ $st == / ]] || continue
+        exp=$(df -P -B1 "$st" | awk 'NR == 2 {print $4}')
+        if (( exp < 104857600 )); then fail "$st has only $(human "$exp") free; the desktop cannot write its session files"; hint "fix-arch-linux clean"; fi
+    done
+    step "Desktop session"
+    local -a sessions=(/usr/share/xsessions/*.desktop /usr/share/wayland-sessions/*.desktop)
+    if (( ${#sessions[@]} )); then ok "${#sessions[@]} desktop session(s) installed"; else warn "No desktop sessions in /usr/share/xsessions or /usr/share/wayland-sessions"; fi
+    plasma_x11_check
+    if dm=$(enabled_dm); then
+        ok "Display manager $dm is enabled"
+    else
+        mapfile -t dms < <(for dm in sddm lightdm gdm lxdm; do is_installed "$dm" && echo "$dm"; done)
+        if (( ${#dms[@]} )); then
+            warn "No display manager is enabled (installed: ${dms[*]})"
+            if confirm "Enable ${dms[0]}?" y; then svc_pkg "${dms[0]}"; svc_enable "${dms[0]}" && ok "Enabled ${dms[0]}"; fi
+        else
+            info "No display manager installed (login on a TTY and start the desktop manually)"
+        fi
+    fi
+    step "Graphics and kernel"
+    nvidia_report || ok "No NVIDIA GPU"
+    if (( ! IN_CHROOT )) && [[ ! -d /usr/lib/modules/$(uname -r) ]]; then
+        fail "The running kernel's modules are missing: graphics and input drivers cannot load"
+        hint "Reboot; if that does not help run: fix-arch-linux boot"
+    fi
+    step "Locale"
+    mapfile -t bad < <(locale_missing)
+    if (( ${#bad[@]} )); then fail "Locale not generated: ${bad[*]}"; confirm "Fix it now?" y && act_locale; else ok "Locale is generated"; fi
+    step "Caches"
+    if [[ -d $h/.cache && $h == /?*/* ]] && confirm "Clear $h/.cache (stale caches can break the desktop after upgrades)?" n; then
+        rm -rf --one-file-system -- "${h:?}/.cache" && ok "Cleared $h/.cache"
+    fi
+}
+
+act_sudo() {
+    local u out f
+    need_user || return 1
+    u=$TARGET_USER
+    if ! is_installed sudo && ! is_installed opendoas; then
+        warn "Neither sudo nor doas is installed"
+        confirm "Install sudo?" y && pacman -S --needed --noconfirm sudo || return 1
+    fi
+    if is_installed sudo; then
+        step "sudoers syntax"
+        if out=$(visudo -c 2>&1); then
+            ok "sudoers files parse cleanly"
+        else
+            fail "sudoers has errors:"
+            indent <<<"$out"
+            while read -r f; do
+                if [[ $f == /etc/sudoers ]]; then
+                    if confirm "Restore the default /etc/sudoers (yours is backed up)?" y; then
+                        backup /etc/sudoers
+                        if pkg_extract_file sudo /etc/sudoers "$WORKDIR/sudoers" && visudo -cf "$WORKDIR/sudoers" >/dev/null; then
+                            install -m 0440 -o root -g root "$WORKDIR/sudoers" /etc/sudoers && ok "Restored /etc/sudoers"
+                        else
+                            fail "Could not get the default sudoers from the sudo package"
+                        fi
+                    fi
+                elif [[ -f $f ]] && confirm "Move the broken $f aside?" y; then
+                    move_aside "$f" && ok "Moved $f to $BACKUP_DIR"
+                fi
+            done < <(grep -oE '/etc/sudoers(\.d/[^:[:space:]]+)?' <<<"$out" | sort -u)
+            visudo -c >/dev/null 2>&1 && ok "sudoers is valid now"
+        fi
+        step "sudo rights for $u"
+        if sudo -l -U "$u" 2>/dev/null | grep -q 'may run'; then
+            ok "$u may use sudo"
+        else
+            fail "$u is not allowed to use sudo"
+            if confirm "Add $u to the wheel group and allow wheel to use sudo?" y; then
+                usermod -aG wheel "$u" && ok "Added $u to wheel"
+                if ! sudo -l -U "$u" 2>/dev/null | grep -q 'may run'; then
+                    f=/etc/sudoers.d/10-wheel
+                    printf '%%wheel ALL=(ALL:ALL) ALL\n' >"$WORKDIR/10-wheel"
+                    visudo -cf "$WORKDIR/10-wheel" >/dev/null && install -m 0440 -o root -g root "$WORKDIR/10-wheel" "$f" && ok "Created $f"
+                fi
+                info "$u must log out and back in for the group change to apply"
+            fi
+        fi
+    fi
+    if is_installed opendoas; then
+        step "doas"
+        f=/etc/doas.conf
+        if [[ -s $f ]] && doas -C "$f" >/dev/null 2>&1 && grep -qE "^[[:space:]]*permit[^#]*([[:space:]]$u|:wheel)([[:space:]]|$)" "$f"; then
+            ok "$f permits $u or wheel"
+        elif confirm "Write 'permit persist :wheel' to $f and add $u to wheel?" y; then
+            backup "$f"
+            printf 'permit persist :wheel\n' >"$f" && chown root:root "$f" && chmod 0400 "$f" && usermod -aG wheel "$u" && ok "doas configured for wheel"
+        fi
+    fi
+}
+
+act_rescue() {
+    local mnt=/mnt/fix-arch-linux root fstype tmp opt sub t dev name chroot_cmd
+    local -a cands labels opened=()
+    if (( IN_CHROOT )); then fail "Already running inside a chroot"; return 1; fi
+    if [[ ! -d /run/archiso && $(findmnt -n -o FSTYPE /) != @(overlay|airootfs|tmpfs|squashfs) ]]; then
+        warn "This does not look like a live USB session"
+        confirm "Continue anyway?" n || return 1
+    fi
+    step "Unlocking encrypted partitions"
+    while read -r dev _ _; do
+        [[ $(blkid -p -o value -s TYPE -- "$dev" 2>/dev/null) == crypto_LUKS ]] || continue
+        [[ -n $(lsblk -nrpo NAME -- "$dev" | sed 1d) ]] && continue
+        name=fal-${dev##*/}
+        if confirm "Unlock $dev?" y && cryptsetup open -- "$dev" "$name"; then opened+=("$name"); ok "Opened /dev/mapper/$name"; fi
+    done < <(lsblk -nrpo NAME,TYPE,MOUNTPOINT)
+    command -v vgchange >/dev/null && vgchange -ay >/dev/null 2>&1
+    step "Selecting the installed system"
+    while read -r dev t mp; do
+        [[ $t == @(part|disk|loop|lvm|crypt|raid*|md) && -z $mp ]] || continue
+        fstype=$(blkid -p -o value -s TYPE -- "$dev" 2>/dev/null)
+        [[ $fstype == @(ext4|ext3|btrfs|xfs|f2fs|jfs|bcachefs) ]] || continue
+        cands+=("$dev $fstype $(lsblk -dnro SIZE -- "$dev" 2>/dev/null)")
+    done < <(lsblk -nrpo NAME,TYPE,MOUNTPOINT)
+    (( ${#cands[@]} )) || { fail "No unmounted Linux partitions found"; return 1; }
+    labels=("${cands[@]}")
+    choose "Root partition of the installed system" "${labels[@]}" || return 1
+    read -r root fstype _ <<<"${cands[CHOICE]}"
+    mkdir -p "$mnt"
+    if [[ $fstype == btrfs ]]; then
+        tmp=$(mktemp -d)
+        mount -o subvolid=5 -- "$root" "$tmp" || { fail "Could not mount $root"; return 1; }
+        sub=
+        for t in @ @root root @rootfs ''; do
+            [[ -e $tmp/${t:+$t/}etc/fstab ]] || continue
+            opt=$(findmnt --fstab --tab-file "$tmp/${t:+$t/}etc/fstab" -n -M / -o OPTIONS 2>/dev/null)
+            sub=$(tr ',' '\n' <<<"$opt" | sed -n 's/^subvol=//p')
+            [[ -z $sub ]] && sub=$t
+            break
+        done
+        umount "$tmp"; rmdir "$tmp"
+        if [[ -n $sub ]]; then mount -o "subvol=$sub" -- "$root" "$mnt"; else mount -- "$root" "$mnt"; fi || { fail "Could not mount $root"; return 1; }
+    else
+        mount -- "$root" "$mnt" || { fail "Could not mount $root"; return 1; }
+    fi
+    if [[ ! -e $mnt/etc/fstab || ! -e $mnt/usr/bin/pacman ]]; then
+        fail "$root does not contain an Arch-based system"
+        umount -R "$mnt"
+        return 1
+    fi
+    ok "Mounted $root on $mnt"
+    for t in /boot /efi /boot/efi /usr /var /home; do
+        findmnt --fstab --tab-file "$mnt/etc/fstab" -n -M "$t" >/dev/null 2>&1 || continue
+        if mount --fstab "$mnt/etc/fstab" --target-prefix "$mnt" "$t" 2>/dev/null; then ok "Mounted $t"; else warn "Could not mount $t from the installed fstab"; fi
+    done
+    if ! chroot "$mnt" /usr/bin/pacman -V >/dev/null 2>&1; then
+        fail "pacman inside the installed system does not run"
+        if confirm "Reinstall pacman into it with the live system's pacman (pacman --sysroot)?" y; then
+            pacman --sysroot "$mnt" -Sy --noconfirm pacman && ok "pacman reinstalled"
+        fi
+    fi
+    install -m 0755 -- "$SELF" "$mnt/root/.fix-arch-linux"
+    if command -v arch-chroot >/dev/null; then chroot_cmd='arch-chroot'
+    elif command -v artix-chroot >/dev/null; then chroot_cmd='artix-chroot'
+    fi
+    step "Entering the installed system"
+    if [[ -n $chroot_cmd ]]; then
+        "$chroot_cmd" "$mnt" /bin/bash /root/.fix-arch-linux
+    else
+        for t in proc sys dev run; do mount --rbind "/$t" "$mnt/$t"; done
+        cp -L /etc/resolv.conf "$mnt/etc/resolv.conf" 2>/dev/null
+        chroot "$mnt" /bin/bash /root/.fix-arch-linux
+    fi
+    rm -f -- "$mnt/root/.fix-arch-linux"
+    sync
+    if umount -R "$mnt" 2>/dev/null; then ok "Unmounted $mnt"
+    else umount -Rl "$mnt" && warn "$mnt was busy and was detached lazily"
+    fi
+    for name in "${opened[@]}"; do cryptsetup close "$name" 2>/dev/null; done
+    info "You can reboot into the repaired system"
+}
+
+act_clock() {
+    local off
+    step "Current time"
+    info "$(date '+%F %T %Z')"
+    if [[ -e /etc/localtime ]]; then
+        info "Time zone: $(readlink /etc/localtime | sed 's|.*/zoneinfo/||')"
+    else
+        fail "No time zone is set (/etc/localtime is missing or broken)"
+        ask "Time zone, for example America/New_York (empty to skip)" ""
+        if [[ -n $REPLY && -f /usr/share/zoneinfo/$REPLY ]]; then
+            ln -sf "/usr/share/zoneinfo/$REPLY" /etc/localtime && ok "Time zone set to $REPLY"
+        elif [[ -n $REPLY ]]; then
+            fail "Unknown time zone $REPLY (see /usr/share/zoneinfo)"
+        fi
+    fi
+    if off=$(clock_offset); then info "Offset from network time: ${off}s"; fi
+    step "Synchronizing"
+    if sync_clock; then ok "Clock set: $(date '+%F %T %Z')"; else fail "No time source was reachable (NTP or HTTP)"; return 1; fi
+    if hwclock --systohc 2>/dev/null; then ok "Hardware clock updated"; else warn "Could not write the hardware clock"; fi
+    grep -qs LOCAL /etc/adjtime && info "The hardware clock is kept in local time (set by /etc/adjtime)"
+    step "Automatic synchronization"
+    enable_ntp
+}
+
+act_network() {
+    local d cls name drv hard soft s fw rc=0
+    local -a conflicts
+    step "Interfaces"
+    ip -br link 2>/dev/null | grep -v '^lo ' | indent
+    ip -br addr 2>/dev/null | grep -v '^lo ' | indent
+    if command -v rfkill >/dev/null; then
+        step "Radio switches"
+        hard=$(rfkill -rno TYPE,HARD 2>/dev/null | awk '$2 == "blocked" {print $1}' | sort -u | xargs)
+        soft=$(rfkill -rno TYPE,SOFT 2>/dev/null | awk '$2 == "blocked" {print $1}' | sort -u | xargs)
+        [[ -n $hard ]] && fail "Blocked by a hardware switch: $hard (use the laptop's wireless key or switch)"
+        if [[ -n $soft ]]; then rfkill unblock all && ok "Unblocked: $soft"; else ok "No radio is blocked in software"; fi
+    fi
+    step "Network hardware"
+    for d in /sys/bus/pci/devices/*; do
+        cls=$(<"$d/class")
+        [[ $cls == 0x02* ]] || continue
+        name=$(lspci -s "${d##*/}" 2>/dev/null | cut -d: -f3- | sed 's/^ //')
+        if [[ -e $d/driver ]]; then
+            drv=$(basename "$(readlink -f "$d/driver")")
+            ok "$name: $drv"
+        else
+            fail "$name: no driver loaded"; rc=1
+        fi
+    done
+    fw=$(dmesg 2>/dev/null | sed -nE 's/.*(firmware: failed to load|Direct firmware load for) ([^ ]+).*/\2/p' | sort -u | head -8 | xargs)
+    [[ -n $fw ]] && warn "Firmware the kernel could not load: $fw"
+    if ! pacman -Qq 2>/dev/null | grep -q '^linux-firmware'; then
+        fail "No linux-firmware package is installed (most Wi-Fi cards need it)"
+        confirm "Install linux-firmware?" y && pacman -S --needed --noconfirm linux-firmware && info "Reboot to load the firmware"
+    fi
+    step "Network management services"
+    if is_installed networkmanager; then
+        svc_pkg networkmanager
+        conflicts=(dhcpcd "$(svc_pick connmand connman 2>/dev/null)")
+        [[ $INIT == systemd ]] && conflicts+=(systemd-networkd)
+        for s in "${conflicts[@]}"; do
+            [[ -n $s ]] && svc_exists "$s" && svc_enabled "$s" || continue
+            warn "$s is enabled alongside NetworkManager; both try to manage the same interfaces"
+            confirm "Disable $s?" y && svc_disable "$s" && ok "Disabled $s"
+        done
+        if nm_uses_iwd; then
+            if ! is_installed iwd; then
+                fail "NetworkManager is configured for iwd (wifi.backend=iwd) but iwd is not installed"
+                confirm "Install iwd?" y && pacman -S --needed --noconfirm iwd && svc_pkg iwd
+            fi
+        elif svc_exists iwd && svc_enabled iwd; then
+            warn "iwd is enabled but NetworkManager uses wpa_supplicant; they fight over Wi-Fi"
+            confirm "Disable iwd?" y && svc_disable iwd && ok "Disabled iwd"
+        fi
+        if svc_enabled NetworkManager; then ok "NetworkManager is enabled"; else svc_enable NetworkManager && ok "Enabled NetworkManager"; fi
+        if (( INIT_LIVE )); then
+            svc_restart NetworkManager && ok "Restarted NetworkManager"
+            sleep 3
+            if command -v nmcli >/dev/null; then
+                [[ $(nmcli networking 2>/dev/null) == disabled ]] && nmcli networking on && ok "Turned NetworkManager networking on"
+                [[ $(nmcli radio wifi 2>/dev/null) == disabled ]] && nmcli radio wifi on && ok "Turned Wi-Fi on"
+                if command -v nm-online >/dev/null && nm-online -q -t 20; then ok "NetworkManager is connected"; else warn "NetworkManager has no active connection yet"; fi
+                nmcli -f DEVICE,TYPE,STATE,CONNECTION device 2>/dev/null | indent
+            fi
+        fi
+    elif [[ $INIT == systemd ]] && compgen -G '/etc/systemd/network/*.network' >/dev/null; then
+        for s in systemd-networkd systemd-resolved; do
+            if svc_enabled "$s"; then ok "$s is enabled"; else svc_enable "$s" && ok "Enabled $s"; fi
+            svc_restart "$s"
+        done
+    elif is_installed iwd && grep -qs 'EnableNetworkConfiguration=true' /etc/iwd/main.conf; then
+        svc_pkg iwd
+        if svc_enabled iwd; then ok "iwd is enabled"; else svc_enable iwd && ok "Enabled iwd"; fi
+        svc_restart iwd
+    elif is_installed dhcpcd; then
+        svc_pkg dhcpcd
+        if svc_enabled dhcpcd; then ok "dhcpcd is enabled"; else svc_enable dhcpcd && ok "Enabled dhcpcd"; fi
+        svc_restart dhcpcd
+    elif is_installed connman; then
+        svc_pkg connman
+        s=$(svc_pick connmand connman)
+        if [[ -n $s ]]; then svc_enabled "$s" || svc_enable "$s"; svc_restart "$s"; fi
+    else
+        fail "No network manager is installed"
+        if confirm "Install NetworkManager now (needs a working connection, e.g. from a live USB chroot)?" n; then
+            pacman -S --needed --noconfirm networkmanager && svc_pkg networkmanager && svc_enable NetworkManager && ok "NetworkManager installed and enabled"
+        fi
+        hint "Without a connection: boot a live USB and run 'fix-arch-linux rescue'"
+        rc=1
+    fi
+    step "Connectivity"
+    connectivity_report
+    case $? in
+        2) confirm "Fix DNS now?" y && act_dns ;;
+        3) confirm "Fix the clock now?" y && act_clock ;;
+    esac
+    return $rc
+}
+
+fix_dnscrypt() {
+    local conf=/etc/dnscrypt-proxy/dnscrypt-proxy.toml sock=0 a
+    local -a addrs
+    step "DNSCrypt"
+    if dnscrypt-proxy -check -config "$conf" >"$WORKDIR/dc.log" 2>&1; then
+        ok "dnscrypt-proxy configuration is valid"
+    else
+        fail "dnscrypt-proxy configuration is invalid:"
+        tail -3 "$WORKDIR/dc.log" | indent
+        if confirm "Restore the packaged default configuration (yours is backed up)?" y; then
+            backup "$conf"
+            if pkg_extract_file dnscrypt-proxy "$conf" "$WORKDIR/dc.toml"; then cat "$WORKDIR/dc.toml" >"$conf" && ok "Restored $conf"
+            else fail "Could not get the default configuration"; return 1
+            fi
+        fi
+    fi
+    mapfile -t addrs < <(sed -nE 's/^[[:space:]]*listen_addresses[[:space:]]*=[[:space:]]*\[(.*)\].*/\1/p' "$conf" | tr ',' '\n' | tr -d " '\"" | grep .)
+    if [[ $INIT == systemd ]]; then
+        systemctl is-enabled --quiet dnscrypt-proxy.socket 2>/dev/null && sock=1
+        if (( ${#addrs[@]} )); then
+            if (( sock )); then
+                warn "dnscrypt-proxy.socket is enabled while listen_addresses is set: both bind port 53"
+                if confirm "Use the service only (disable the socket)?" y; then systemctl disable --now dnscrypt-proxy.socket >/dev/null 2>&1; fi
+            fi
+            systemctl is-enabled --quiet dnscrypt-proxy.service 2>/dev/null || svc_enable dnscrypt-proxy.service
+            svc_restart dnscrypt-proxy.service
+        else
+            info "listen_addresses is empty, so dnscrypt-proxy runs from its socket unit"
+            (( sock )) || svc_enable dnscrypt-proxy.socket
+            svc_restart dnscrypt-proxy.socket
+        fi
+    else
+        svc_pkg dnscrypt-proxy
+        svc_enabled dnscrypt-proxy || svc_enable dnscrypt-proxy
+        svc_restart dnscrypt-proxy
+    fi
+    sleep 2
+    (( ${#addrs[@]} )) || addrs=(127.0.0.1:53)
+    a=${addrs[0]%:*}; a=${a#[}; a=${a%]}
+    [[ $a == 0.0.0.0 ]] && a=127.0.0.1
+    [[ $a == :: ]] && a=::1
+    if listening_dns "$a"; then ok "dnscrypt-proxy is listening on $a"; else fail "dnscrypt-proxy is not listening on $a:53"; ss -Hlnup 'sport = :53' 2>/dev/null | indent; return 1; fi
+    if ! grep -qE "^nameserver[[:space:]]+$a([[:space:]]|$)" /etc/resolv.conf 2>/dev/null; then
+        warn "/etc/resolv.conf does not point to dnscrypt-proxy"
+        if confirm "Point it to $a and stop NetworkManager from overwriting it?" y; then
+            if is_installed networkmanager; then
+                printf '[main]\ndns=none\n' >/etc/NetworkManager/conf.d/90-fix-arch-linux-dns.conf
+                ok "NetworkManager: dns=none"
+                (( INIT_LIVE )) && command -v nmcli >/dev/null && nmcli general reload >/dev/null 2>&1
+            fi
+            write_resolv_conf "$a"
+            printf 'options edns0\n' >>/etc/resolv.conf
+        fi
+    else
+        ok "/etc/resolv.conf points to dnscrypt-proxy"
+    fi
+}
+
+act_dns() {
+    local target n local_down=0 mode
+    local -a ns
+    step "/etc/resolv.conf"
+    if [[ -L /etc/resolv.conf ]]; then
+        target=$(readlink /etc/resolv.conf)
+        if [[ ! -e /etc/resolv.conf ]]; then
+            fail "/etc/resolv.conf points to $target, which does not exist"
+            if [[ $target == */systemd/resolve/* && $INIT == systemd ]] && confirm "Enable systemd-resolved, which provides that file?" y; then
+                svc_enable systemd-resolved && sleep 2
+            else
+                confirm "Replace it with a regular file?" y && write_resolv_conf
+            fi
+        else
+            ok "/etc/resolv.conf -> $target"
+        fi
+    elif [[ ! -s /etc/resolv.conf ]]; then
+        fail "/etc/resolv.conf is empty or missing"
+        if is_installed networkmanager && svc_active NetworkManager && [[ $(nm_dns_mode) != none ]]; then
+            svc_restart NetworkManager && sleep 3 && ok "NetworkManager rewrote /etc/resolv.conf"
+        fi
+        [[ -s /etc/resolv.conf ]] || write_resolv_conf
+    else
+        ok "/etc/resolv.conf is a regular file"
+    fi
+    lsattr /etc/resolv.conf 2>/dev/null | cut -d' ' -f1 | grep -q i && info "/etc/resolv.conf is immutable (chattr +i)"
+    mapfile -t ns < <(awk '$1 == "nameserver" {print $2}' /etc/resolv.conf 2>/dev/null)
+    if (( ! ${#ns[@]} )); then
+        fail "No nameserver entries"
+        confirm "Use 1.1.1.1 and 9.9.9.9?" y && write_resolv_conf && mapfile -t ns < <(awk '$1 == "nameserver" {print $2}' /etc/resolv.conf)
+    fi
+    for n in "${ns[@]}"; do
+        if [[ $n == 127.* || $n == ::1 ]]; then
+            if listening_dns "$n"; then ok "Local resolver $n is listening"; else fail "Nothing listens on $n:53"; local_down=1; fi
+        else
+            ok "Nameserver $n"
+        fi
+    done
+    is_installed dnscrypt-proxy && fix_dnscrypt
+    if (( local_down )); then
+        if [[ " ${ns[*]} " == *" 127.0.0.53 "* && $INIT == systemd ]]; then
+            step "systemd-resolved"
+            if svc_enabled systemd-resolved; then svc_restart systemd-resolved; else svc_enable systemd-resolved; fi
+            sleep 2
+        fi
+        for mode in unbound dnsmasq; do
+            is_installed "$mode" || continue
+            step "$mode"
+            svc_pkg "$mode"
+            svc_enabled "$mode" || svc_enable "$mode"
+            svc_restart "$mode" && ok "Restarted $mode"
+        done
+    fi
+    step "Resolution test"
+    if getent ahosts archlinux.org >/dev/null 2>&1; then
+        ok "archlinux.org resolves"
+    else
+        fail "archlinux.org does not resolve"
+        if confirm "Try the public resolvers 1.1.1.1 and 9.9.9.9?" y; then
+            cp -a --remove-destination /etc/resolv.conf "$WORKDIR/resolv.conf.prev" 2>/dev/null
+            write_resolv_conf
+            if getent ahosts archlinux.org >/dev/null 2>&1; then
+                ok "Resolution works with the public resolvers"
+            else
+                [[ -e $WORKDIR/resolv.conf.prev || -L $WORKDIR/resolv.conf.prev ]] && cp -a --remove-destination "$WORKDIR/resolv.conf.prev" /etc/resolv.conf && info "Restored the previous /etc/resolv.conf"
+                fail "Public resolvers do not answer either: the network itself is down (fix-arch-linux network)"
+                return 1
+            fi
+        else
+            return 1
+        fi
+    fi
+}
+
+act_audio() {
+    local u units=() unit
+    need_user || return 1
+    u=$TARGET_USER
+    step "Sound hardware"
+    if [[ -r /proc/asound/cards ]] && ! grep -q 'no soundcards' /proc/asound/cards; then
+        indent </proc/asound/cards
+    else
+        fail "The kernel found no sound card"
+        if dmesg 2>/dev/null | grep -qiE 'sof-audio|snd_sof'; then
+            is_installed sof-firmware || { confirm "Install sof-firmware (Intel Sound Open Firmware)?" y && pacman -S --needed --noconfirm sof-firmware && info "Reboot to load it"; }
+        else
+            hint "Check that audio is enabled in the firmware setup and look for snd_ errors: fix-arch-linux logs"
+        fi
+        return 1
+    fi
+    if dmesg 2>/dev/null | grep -qiE 'sof-audio|sof_.*firmware|sof.*failed'; then
+        if is_installed sof-firmware; then ok "sof-firmware is installed"
+        else
+            fail "This machine uses Intel Sound Open Firmware, but sof-firmware is not installed"
+            confirm "Install sof-firmware?" y && pacman -S --needed --noconfirm sof-firmware && info "Reboot to load it"
+        fi
+    fi
+    step "Sound server"
+    if is_installed pipewire; then
+        ok "PipeWire is installed"
+        is_installed wireplumber || { fail "PipeWire has no session manager"; confirm "Install wireplumber?" y && pacman -S --needed --noconfirm wireplumber; }
+        if ! is_installed pipewire-pulse && ! is_installed pulseaudio; then
+            warn "No PulseAudio server: most applications will be silent"
+            confirm "Install pipewire-pulse?" y && pacman -S --needed --noconfirm pipewire-pulse
+        fi
+        is_installed pipewire-alsa || info "pipewire-alsa is not installed (ALSA-only programs bypass PipeWire)"
+    elif is_installed pulseaudio; then
+        ok "PulseAudio is installed"
+    else
+        fail "No sound server is installed"
+        confirm "Install PipeWire (pipewire pipewire-pulse pipewire-alsa wireplumber)?" y && pacman -S --needed --noconfirm pipewire pipewire-pulse pipewire-alsa wireplumber
+    fi
+    if [[ $INIT == systemd ]] && (( INIT_LIVE )); then
+        step "User services of $u"
+        for unit in pipewire.socket pipewire-pulse.socket wireplumber.service; do
+            systemctl --global is-enabled --quiet "$unit" 2>/dev/null && continue
+            [[ -e /usr/lib/systemd/user/$unit ]] || continue
+            systemctl --global enable "$unit" >/dev/null 2>&1 && ok "Enabled $unit for all users"
+        done
+        if [[ -d $TARGET_HOME/.local/state/wireplumber ]] && confirm "Reset WirePlumber's saved devices and volumes (fixes wrong default outputs)?" n; then
+            move_aside "$TARGET_HOME/.local/state/wireplumber" && ok "Moved WirePlumber state to $BACKUP_DIR"
+        fi
+        for unit in pipewire pipewire-pulse wireplumber pulseaudio; do
+            [[ -e /usr/lib/systemd/user/$unit.service ]] && units+=("$unit")
+        done
+        if loginctl show-user "$u" >/dev/null 2>&1; then
+            if systemctl --user -M "$u@" restart "${units[@]}" 2>/dev/null; then ok "Restarted ${units[*]}"; else warn "Could not restart the user services (is $u logged in?)"; fi
+        else
+            info "$u has no running session; the services start at the next login"
+        fi
+    else
+        info "Without systemd, PipeWire is started by the desktop session: log out and back in"
+    fi
+    if command -v amixer >/dev/null && amixer sget Master 2>/dev/null | grep -q '\[off\]'; then
+        amixer -q sset Master unmute && ok "Unmuted the ALSA Master channel"
+    fi
+}
+
+bt_hardware() {
+    local d
+    compgen -G '/sys/class/bluetooth/hci*' >/dev/null && return 0
+    for d in /sys/bus/usb/devices/*:*; do
+        [[ $(<"$d/bInterfaceClass") == e0 && $(<"$d/bInterfaceSubClass") == 01 && $(<"$d/bInterfaceProtocol") == 01 ]] 2>/dev/null && return 0
+    done
+    rfkill -rno TYPE 2>/dev/null | grep -qx bluetooth
+}
+
+act_bluetooth() {
+    local s
+    step "Hardware"
+    if ! bt_hardware; then
+        fail "No Bluetooth adapter detected"
+        hint "Enable Bluetooth in the firmware setup or check the laptop's wireless switch"
+        return 1
+    fi
+    ok "Bluetooth adapter present"
+    step "Packages"
+    if ! is_installed bluez; then
+        fail "bluez is not installed"
+        confirm "Install bluez and bluez-utils?" y && pacman -S --needed --noconfirm bluez bluez-utils || return 1
+    else
+        ok "bluez is installed"
+    fi
+    svc_pkg bluez
+    step "Radio and driver"
+    if command -v rfkill >/dev/null && rfkill -rno TYPE,SOFT 2>/dev/null | grep -q 'bluetooth blocked'; then
+        rfkill unblock bluetooth && ok "Unblocked Bluetooth"
+    fi
+    rfkill -rno TYPE,HARD 2>/dev/null | grep -q 'bluetooth blocked' && fail "Bluetooth is blocked by a hardware switch"
+    if ! compgen -G '/sys/class/bluetooth/hci*' >/dev/null; then
+        modprobe btusb 2>/dev/null
+        sleep 2
+    fi
+    if compgen -G '/sys/class/bluetooth/hci*' >/dev/null; then ok "Bluetooth controller found"; else fail "No Bluetooth controller found"; fi
+    dmesg 2>/dev/null | grep -iE 'bluetooth.*(firmware|failed)' | tail -3 | indent
+    step "Service"
+    s=$(svc_pick bluetooth bluetoothd) || { fail "No Bluetooth service found"; return 1; }
+    if svc_enabled "$s"; then ok "$s is enabled"; else svc_enable "$s" && ok "Enabled $s"; fi
+    svc_restart "$s" && ok "Restarted $s"
+    if (( INIT_LIVE )) && command -v bluetoothctl >/dev/null; then
+        sleep 2
+        if bluetoothctl show 2>/dev/null | grep -q 'Powered: yes'; then ok "Controller is powered on"
+        else bluetoothctl power on >/dev/null 2>&1 && ok "Powered the controller on"
+        fi
+    fi
+}
+
+act_locale() {
+    local v line conf=/etc/locale.conf
+    local -a missing
+    step "Locale configuration"
+    if [[ ! -s $conf ]]; then
+        fail "$conf is missing"
+        ask "Locale to use" "en_US.UTF-8"
+        backup "$conf"
+        printf 'LANG=%s\n' "$REPLY" >"$conf" && ok "Wrote LANG=$REPLY to $conf"
+    else
+        info "$(tr '\n' ' ' <"$conf")"
+    fi
+    mapfile -t missing < <(locale_missing)
+    if (( ! ${#missing[@]} )); then ok "Every configured locale is generated"; return 0; fi
+    backup /etc/locale.gen
+    for v in "${missing[@]}"; do
+        line=$(grep -m1 -E "^${v//./\\.}[[:space:]]" /usr/share/i18n/SUPPORTED 2>/dev/null)
+        if [[ -z $line ]]; then fail "$v is not a supported locale (see /usr/share/i18n/SUPPORTED)"; continue; fi
+        if grep -qE "^#[[:space:]]*${line//./\\.}[[:space:]]*$" /etc/locale.gen; then
+            sed -i -E "s/^#[[:space:]]*(${line//./\\.})[[:space:]]*$/\1/" /etc/locale.gen
+        elif ! grep -qE "^${line//./\\.}[[:space:]]*$" /etc/locale.gen; then
+            printf '%s\n' "$line" >>/etc/locale.gen
+        fi
+        ok "Enabled $line in /etc/locale.gen"
+    done
+    step "Generating locales"
+    locale-gen
+    mapfile -t missing < <(locale_missing)
+    if (( ${#missing[@]} )); then fail "Still missing: ${missing[*]}"; return 1; fi
+    ok "Locales generated; log out and back in to apply"
+}
+
+act_services() {
+    local s
+    local -a failed
+    step "Failed services"
+    if (( ! INIT_LIVE )); then info "No running init system (chroot): nothing to restart"; return 0; fi
+    mapfile -t failed < <(failed_services)
+    if (( ! ${#failed[@]} )); then
+        ok "No failed services"
+    else
+        for s in "${failed[@]}"; do fail "$s"; done
+        if confirm "Restart them?" y; then
+            [[ $INIT == systemd ]] && systemctl reset-failed
+            for s in "${failed[@]}"; do
+                case $INIT in
+                    systemd) systemctl restart -- "$s" ;;
+                    openrc) rc-service "$s" restart ;;
+                    runit) sv restart "$s" ;;
+                esac >/dev/null 2>&1
+                sleep 1
+                if [[ $INIT == systemd ]] && ! systemctl is-active --quiet -- "$s"; then
+                    fail "$s failed again:"
+                    journalctl -b -u "$s" -n 8 --no-pager 2>/dev/null | indent
+                else
+                    ok "$s restarted"
+                fi
+            done
+        fi
+    fi
+    case $INIT in
+        systemd)
+            if [[ -n $TARGET_USER ]] && loginctl show-user "$TARGET_USER" >/dev/null 2>&1; then
+                mapfile -t failed < <(systemctl --user -M "$TARGET_USER@" --failed --no-legend --plain 2>/dev/null | awk '{print $1}')
+                if (( ${#failed[@]} )); then
+                    fail "Failed user services of $TARGET_USER: ${failed[*]}"
+                    confirm "Restart them?" y && systemctl --user -M "$TARGET_USER@" restart "${failed[@]}" && ok "Restarted"
+                else
+                    ok "No failed user services for $TARGET_USER"
+                fi
+            fi ;;
+        s6)
+            info "Bringing up every service in the default bundle"
+            s6-rc -u change default && ok "s6 default bundle is up" ;;
+        dinit)
+            dinitctl list 2>/dev/null | indent ;;
+    esac
+}
+
+list_actions() {
+    local e
+    for e in "${MENU[@]}"; do
+        [[ $e == '#'* ]] && continue
+        printf '  %-10s %s\n' "${e%%:*}" "${e#*:}"
+    done
+}
+
+usage() {
+    cat <<EOF
+Usage: fix-arch-linux [options] [action]
+
+Without an action, an interactive menu opens.
+
+Options:
+  --noconfirm   accept the default answer for every prompt
+  --no-color    disable colors
+  -l, --list    list actions
+  -h, --help    show this help
+  -V, --version show the version
+
+Actions:
+$(list_actions)
+
+Backups of changed files: /var/lib/fix-arch-linux/backup/<date>/
+EOF
+}
+
+menu_main() {
+    local -a labels=() keys=()
+    local e
+    for e in "${MENU[@]}"; do
+        if [[ $e == '#'* ]]; then labels+=("$e"); keys+=(''); else labels+=("${e#*:}"); keys+=("${e%%:*}"); fi
+    done
+    labels+=("Quit"); keys+=(quit)
+    trap 'printf "\n"' INT
+    while :; do
+        CHOOSE_QUIT=quit
+        choose "Fix Arch Linux" "${labels[@]}" || break
+        CHOOSE_QUIT=back
+        [[ ${keys[CHOICE]} == quit ]] && break
+        local start=$CHOICE
+        ( trap - INT; N_OK=0 N_WARN=0 N_FAIL=0; "act_${keys[start]}" )
+        echo
+        pause "Press Enter to return to the menu..."
+        CHOOSE_START=$start
+    done
+    trap - INT
+}
+
+main() {
+    local action='' a
+    for a; do
+        case $a in
+            --noconfirm) NOCONFIRM=1 ;;
+            --no-color) NO_COLOR=1 ;;
+            -h|--help) setup_ui; usage; exit 0 ;;
+            -l|--list) list_actions; exit 0 ;;
+            -V|--version) echo "fix-arch-linux $VERSION"; exit 0 ;;
+            -*) echo "Unknown option: $a (see --help)" >&2; exit 2 ;;
+            *)
+                [[ -z $action ]] || { echo "Only one action can be given" >&2; exit 2; }
+                action=$a ;;
+        esac
+    done
+    if [[ -n $action ]] && ! declare -F "act_$action" >/dev/null; then
+        echo "Unknown action: $action (see --list)" >&2
+        exit 2
+    fi
+    command -v pacman >/dev/null || { echo "pacman not found: fix-arch-linux is for Arch Linux and Arch-based systems" >&2; exit 1; }
+    elevate "$@"
+    setup_ui
+    (( NOCONFIRM )) && NC=(--noconfirm)
+    WORKDIR=$(mktemp -d /tmp/fix-arch-linux.XXXXXX) || exit 1
+    trap 'rm -rf -- "$WORKDIR"; [[ -t 1 ]] && printf "\e[?25h"' EXIT
+    detect_system
+    detect_user
+    pacman_paths
+    if [[ -n $action ]]; then
+        "act_$action"
+        exit
+    fi
+    if ! has_tty; then usage; exit 2; fi
+    menu_main
+}
+
+main "$@"
