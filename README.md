@@ -72,10 +72,6 @@ Repair tool for Arch Linux and Arch-based distributions (Artix, EndeavourOS, Man
 
 . Failed services
 
-<p align="left">
-    <img src="https://i.postimg.cc/mZ66nBHS/script.png" style="width:50%; height:auto;" />
-</p>
-
 ## How to Install
 
 ```
